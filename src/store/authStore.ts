@@ -1,5 +1,6 @@
 ﻿import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { error as logError } from '@tauri-apps/plugin-log';
 import { createClient, Session, User } from '@supabase/supabase-js';
 
 // Custom Storage adapter for Supabase using Tauri keyring commands
@@ -9,7 +10,7 @@ const tauriSecureStorage = {
       const token = await invoke<string | null>('get_auth_token', { key });
       return token;
     } catch (e) {
-      console.error('Error getting auth token:', e);
+      logError(`Error getting auth token: ${String(e)}`).catch(() => {});
       return null;
     }
   },
@@ -17,14 +18,14 @@ const tauriSecureStorage = {
     try {
       await invoke('store_auth_token', { key, token: value });
     } catch (e) {
-      console.error('Error storing auth token:', e);
+      logError(`Error storing auth token: ${String(e)}`).catch(() => {});
     }
   },
   removeItem: async (key: string): Promise<void> => {
     try {
       await invoke('delete_auth_token', { key });
     } catch (e) {
-      console.error('Error deleting auth token:', e);
+      logError(`Error deleting auth token: ${String(e)}`).catch(() => {});
     }
   },
 };
@@ -67,7 +68,7 @@ export const useAuthStore = create<AuthState>((set) => ({
         set({ session, user: session?.user ?? null });
       });
     } catch (error) {
-      console.error('Failed to initialize auth:', error);
+      logError(`Failed to initialize auth: ${String(error)}`).catch(() => {});
       set({ initialized: true, loading: false });
     }
   },
@@ -77,7 +78,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       await supabase.auth.signOut();
       set({ user: null, session: null });
     } catch (error) {
-      console.error('Error signing out:', error);
+      logError(`Error signing out: ${String(error)}`).catch(() => {});
     }
   },
 }));

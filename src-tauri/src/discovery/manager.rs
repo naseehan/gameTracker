@@ -3,7 +3,8 @@ use super::gog::GogProvider;
 use super::models::GameCandidate;
 use super::provider::DiscoveryProvider;
 use super::steam::SteamProvider;
-use rusqlite::Connection;
+use crate::database::normalize_name;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 
 /// The result of scanning the installed launchers.
@@ -146,11 +147,30 @@ fn apply_scan(db: &mut Connection, scan: &DiscoveryScan) -> rusqlite::Result<()>
             let removed_check: i64 = tx.query_row("SELECT count(*) FROM games g JOIN game_platforms gp ON g.id = gp.game_id WHERE gp.platform = ?1 AND gp.external_id = ?2", rusqlite::params![candidate.source, app_id], |r| r.get(0))?;
 
             if removed_check == 0 {
-                tx.execute("INSERT INTO games (name, normalized_name, current_install_status) VALUES (?1, ?2, 'Installed')", rusqlite::params![candidate.name, candidate.name.to_lowercase()])?;
-                let game_id = tx.last_insert_rowid();
+                // The same game may already be in the library, added by hand or found on
+                // another launcher. Attach this platform to it instead of adding it twice.
+                let normalized_name = normalize_name(&candidate.name);
+                let existing_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM games WHERE normalized_name = ?1 AND is_removed = 0 ORDER BY id LIMIT 1",
+                        rusqlite::params![normalized_name],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+
+                let game_id = match existing_id {
+                    Some(id) => {
+                        tx.execute("UPDATE games SET current_install_status = 'Installed', updated_at = CURRENT_TIMESTAMP WHERE id = ?1", rusqlite::params![id])?;
+                        id
+                    }
+                    None => {
+                        tx.execute("INSERT INTO games (name, normalized_name, current_install_status) VALUES (?1, ?2, 'Installed')", rusqlite::params![candidate.name, normalized_name])?;
+                        tx.last_insert_rowid()
+                    }
+                };
 
                 tx.execute("INSERT INTO game_platforms (game_id, platform, external_id) VALUES (?1, ?2, ?3)", rusqlite::params![game_id, candidate.source, app_id])?;
-                tx.execute("INSERT INTO game_installations (game_id, installation_path, detection_source) VALUES (?1, ?2, ?3)", rusqlite::params![game_id, candidate.install_path, candidate.source])?;
+                tx.execute("INSERT INTO game_installations (game_id, installation_path, detection_source) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM game_installations WHERE game_id = ?1 AND installation_path = ?2)", rusqlite::params![game_id, candidate.install_path, candidate.source])?;
 
                 for exe in &candidate.executables {
                     let exe_path = std::path::Path::new(exe);
@@ -159,7 +179,7 @@ fn apply_scan(db: &mut Connection, scan: &DiscoveryScan) -> rusqlite::Result<()>
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_string();
-                    tx.execute("INSERT INTO game_executables (game_id, executable_name, executable_path, detection_confidence) VALUES (?1, ?2, ?3, ?4)", rusqlite::params![game_id, exe_name, exe, candidate.confidence])?;
+                    tx.execute("INSERT INTO game_executables (game_id, executable_name, executable_path, detection_confidence) SELECT ?1, ?2, ?3, ?4 WHERE NOT EXISTS (SELECT 1 FROM game_executables WHERE game_id = ?1 AND executable_path = ?3)", rusqlite::params![game_id, exe_name, exe, candidate.confidence])?;
                 }
             }
         }
@@ -247,5 +267,28 @@ mod tests {
         };
         manager.apply(&mut db, &uninstalled).unwrap();
         assert_eq!(install_status(&db), "Not Installed");
+    }
+
+    #[test]
+    fn test_discovered_game_joins_game_added_by_hand() {
+        let mut db = setup_test_db();
+        db.execute(
+            "INSERT INTO games (id, name, normalized_name) VALUES (7, 'HADES', 'hades')",
+            [],
+        )
+        .unwrap();
+        let scan = DiscoveryScan {
+            candidates: vec![steam_game("1145360")],
+            found_app_ids: HashMap::from([("Steam".to_string(), HashSet::from(["1145360".to_string()]))]),
+        };
+
+        DiscoveryManager::new().apply(&mut db, &scan).unwrap();
+
+        let games: i64 = db.query_row("SELECT COUNT(*) FROM games", [], |r| r.get(0)).unwrap();
+        assert_eq!(games, 1);
+        let platform_game: i64 = db
+            .query_row("SELECT game_id FROM game_platforms", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(platform_game, 7);
     }
 }

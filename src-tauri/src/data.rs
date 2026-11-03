@@ -1,6 +1,6 @@
 use crate::models::{Game, GameExecutable, GameSession};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, Result, Transaction};
+use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone)]

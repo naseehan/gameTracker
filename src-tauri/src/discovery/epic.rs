@@ -2,7 +2,7 @@ use super::models::GameCandidate;
 use super::provider::DiscoveryProvider;
 use serde_json::Value;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub struct EpicProvider {
     override_path: Option<PathBuf>,

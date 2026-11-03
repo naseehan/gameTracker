@@ -1,6 +1,13 @@
 use rusqlite::{Connection, OptionalExtension, Result};
 use std::fs;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
+
+pub mod editing;
+
+const DB_FILE: &str = "gametracker.db";
+/// The app id before the app was named GameTracker. Its data folder was named after it.
+const LEGACY_APP_ID: &str = "com.naseeh.tauri-app";
 
 pub fn initialize_database(app: &AppHandle) -> Result<Connection> {
     let app_dir = app
@@ -11,9 +18,10 @@ pub fn initialize_database(app: &AppHandle) -> Result<Connection> {
     if !app_dir.exists() {
         fs::create_dir_all(&app_dir).expect("Failed to create app data dir");
     }
+    let migrated_from = copy_legacy_data_dir(&app_dir);
 
-    let db_path = app_dir.join("gametracker.db");
-    let conn = Connection::open(db_path)?;
+    let db_path = app_dir.join(DB_FILE);
+    let mut conn = Connection::open(db_path)?;
 
     // Configure SQLite
     conn.execute_batch(
@@ -23,8 +31,153 @@ pub fn initialize_database(app: &AppHandle) -> Result<Connection> {
     )?;
 
     run_migrations(&conn)?;
+    if let Some(legacy_dir) = migrated_from {
+        if let Err(e) = move_cover_paths(&conn, &legacy_dir.join("covers"), &app_dir.join("covers")) {
+            log::error!("Failed to update cover paths after moving data: {}", e);
+        }
+    }
+
+    // One-time cleanup of games that were added twice under slightly different names.
+    // New duplicates are prevented when games are added, so this doesn't need to rerun.
+    if crate::settings::get_setting(&conn, "library_names_v2")?.is_none() {
+        match merge_duplicate_games(&mut conn) {
+            Ok(merged) => {
+                log::info!("Merged {} duplicate games", merged);
+                crate::settings::set_setting(&conn, "library_names_v2", "true")?;
+            }
+            // A failed merge leaves the library as it was; it's retried on the next start.
+            Err(e) => log::error!("Failed to merge duplicate games: {}", e),
+        }
+    }
 
     Ok(conn)
+}
+
+/// Copies the database and covers from the folder of the app's old id the first time the
+/// renamed app starts. The old folder is kept as a backup. Returns the old folder if
+/// anything was copied.
+fn copy_legacy_data_dir(app_dir: &Path) -> Option<PathBuf> {
+    let legacy_dir = app_dir.parent()?.join(LEGACY_APP_ID);
+    if legacy_dir == app_dir || app_dir.join(DB_FILE).exists() || !legacy_dir.join(DB_FILE).exists() {
+        return None;
+    }
+
+    for file in [DB_FILE, "gametracker.db-wal", "gametracker.db-shm"] {
+        let source = legacy_dir.join(file);
+        if source.exists() {
+            if let Err(e) = fs::copy(&source, app_dir.join(file)) {
+                log::error!("Failed to copy {} from the old data folder: {}", file, e);
+                let _ = fs::remove_file(app_dir.join(DB_FILE));
+                return None;
+            }
+        }
+    }
+
+    let covers = legacy_dir.join("covers");
+    if let Ok(entries) = fs::read_dir(&covers) {
+        let _ = fs::create_dir_all(app_dir.join("covers"));
+        for entry in entries.flatten() {
+            let _ = fs::copy(entry.path(), app_dir.join("covers").join(entry.file_name()));
+        }
+    }
+
+    log::info!("Copied data from {} to {}", legacy_dir.display(), app_dir.display());
+    Some(legacy_dir)
+}
+
+/// Points covers stored in the old data folder at their copies in the new one.
+fn move_cover_paths(conn: &Connection, old_covers: &Path, new_covers: &Path) -> Result<()> {
+    let covers: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, cover_path FROM games WHERE cover_path IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<_>>()?
+    };
+    for (id, cover) in covers {
+        if let Ok(file) = Path::new(&cover).strip_prefix(old_covers) {
+            conn.execute(
+                "UPDATE games SET cover_path = ?1 WHERE id = ?2",
+                rusqlite::params![new_covers.join(file).to_string_lossy(), id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The key used to recognise the same game under slightly different names, e.g.
+/// "Cyberpunk 2077" from Steam and "CYBERPUNK 2077™" added by hand.
+pub fn normalize_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Brings every game's normalized name up to date, then merges games that are in the
+/// library twice (e.g. added by hand and later found on Steam). The oldest entry keeps
+/// everything from the newer one: sessions, platforms, installs and executables.
+/// Removed games are left alone. Returns how many duplicates were merged.
+pub fn merge_duplicate_games(conn: &mut Connection) -> Result<usize> {
+    let tx = conn.transaction()?;
+
+    let games: Vec<(i64, String, bool)> = {
+        let mut stmt = tx.prepare("SELECT id, name, is_removed FROM games ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<_>>()?
+    };
+
+    let mut first_by_name: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut merged = 0;
+    for (id, name, is_removed) in games {
+        let key = normalize_name(&name);
+        tx.execute(
+            "UPDATE games SET normalized_name = ?1 WHERE id = ?2 AND normalized_name != ?1",
+            rusqlite::params![key, id],
+        )?;
+        if is_removed || key.is_empty() {
+            continue;
+        }
+        match first_by_name.get(&key) {
+            Some(&keep_id) => {
+                merge_game_into(&tx, id, keep_id)?;
+                merged += 1;
+            }
+            None => {
+                first_by_name.insert(key, id);
+            }
+        }
+    }
+
+    tx.commit()?;
+    Ok(merged)
+}
+
+fn merge_game_into(tx: &rusqlite::Transaction, from_id: i64, into_id: i64) -> Result<()> {
+    for table in [
+        "game_sessions",
+        "game_platforms",
+        "game_installations",
+        "game_executables",
+    ] {
+        tx.execute(
+            &format!("UPDATE {} SET game_id = ?1 WHERE game_id = ?2", table),
+            rusqlite::params![into_id, from_id],
+        )?;
+    }
+    // Keep the duplicate's cover if the kept game has none, and treat the game as
+    // installed or ignored if either entry was.
+    tx.execute(
+        "UPDATE games SET
+            cover_path = COALESCE(cover_path, (SELECT cover_path FROM games WHERE id = ?2)),
+            current_install_status = CASE
+                WHEN (SELECT current_install_status FROM games WHERE id = ?2) = 'Installed' THEN 'Installed'
+                ELSE current_install_status END,
+            is_ignored = is_ignored OR (SELECT is_ignored FROM games WHERE id = ?2),
+            updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1",
+        rusqlite::params![into_id, from_id],
+    )?;
+    tx.execute("DELETE FROM games WHERE id = ?1", rusqlite::params![from_id])?;
+    Ok(())
 }
 
 pub fn run_migrations(conn: &Connection) -> Result<()> {
@@ -104,6 +257,8 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         "ALTER TABLE game_sessions ADD COLUMN last_heartbeat_at DATETIME",
         [],
     );
+    // When cover art was last looked up for a game without a cover.
+    let _ = conn.execute("ALTER TABLE games ADD COLUMN cover_lookup_at DATETIME", []);
 
     // Set default settings if not exists
     let _ = conn.execute(
@@ -118,6 +273,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+use crate::detection::detector::{GameDetector, GameInstallDir};
 use crate::models::{Game, GameExecutable};
 
 pub fn get_all_executables(conn: &Connection) -> Result<Vec<GameExecutable>> {
@@ -136,6 +292,29 @@ pub fn get_all_executables(conn: &Connection) -> Result<Vec<GameExecutable>> {
         execs.push(exec?);
     }
     Ok(execs)
+}
+
+/// Install folders of the games in the library, used to recognise their processes.
+pub fn get_install_dirs(conn: &Connection) -> Result<Vec<GameInstallDir>> {
+    let mut stmt = conn.prepare(
+        "SELECT gi.game_id, gi.installation_path
+         FROM game_installations gi JOIN games g ON g.id = gi.game_id
+         WHERE g.is_removed = 0 AND gi.installation_path IS NOT NULL AND gi.uninstalled_at IS NULL",
+    )?;
+    let dirs = stmt
+        .query_map([], |row| {
+            Ok(GameInstallDir {
+                game_id: row.get(0)?,
+                path: row.get(1)?,
+            })
+        })?
+        .collect();
+    dirs
+}
+
+/// Builds a detector for every executable and install folder in the database.
+pub fn load_detector(conn: &Connection) -> Result<GameDetector> {
+    Ok(GameDetector::new(get_all_executables(conn)?, get_install_dirs(conn)?))
 }
 
 pub fn get_game_by_id(conn: &Connection, game_id: i64) -> Result<Option<Game>> {
@@ -164,7 +343,7 @@ pub fn get_game_by_id(conn: &Connection, game_id: i64) -> Result<Option<Game>> {
     }
 }
 
-use crate::models::GameSession;
+use crate::models::RecentSession;
 use chrono::{DateTime, Utc};
 
 pub fn create_session(conn: &Connection, game_id: i64, started_at: DateTime<Utc>) -> Result<i64> {
@@ -219,23 +398,27 @@ pub fn recover_sessions(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub fn get_recent_sessions(conn: &Connection, limit: u32) -> Result<Vec<GameSession>> {
-    let mut stmt = conn.prepare("SELECT id, game_id, started_at, ended_at, duration_seconds, detection_source FROM game_sessions ORDER BY started_at DESC LIMIT ?1")?;
-    let iter = stmt.query_map([limit], |row| {
-        Ok(GameSession {
+/// The most recent finished sessions, with their game's name and cover. Running
+/// sessions are left out; they come from the tracker.
+pub fn get_recent_sessions(conn: &Connection, limit: u32) -> Result<Vec<RecentSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.game_id, g.name, g.cover_path, s.started_at, s.ended_at, COALESCE(s.duration_seconds, 0)
+         FROM game_sessions s JOIN games g ON g.id = s.game_id
+         WHERE s.ended_at IS NOT NULL
+         ORDER BY s.started_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit], |row| {
+        Ok(RecentSession {
             id: row.get(0)?,
             game_id: row.get(1)?,
-            started_at: row.get(2)?,
-            ended_at: row.get(3)?,
-            duration_seconds: row.get(4)?,
-            detection_source: row.get(5)?,
+            game_name: row.get(2)?,
+            cover_path: row.get(3)?,
+            started_at: row.get(4)?,
+            ended_at: row.get(5)?,
+            duration_seconds: row.get(6)?,
         })
     })?;
-    let mut res = Vec::new();
-    for s in iter {
-        res.push(s?);
-    }
-    Ok(res)
+    rows.collect()
 }
 
 use crate::models::GameLibraryItem;
@@ -354,21 +537,27 @@ mod tests {
 use crate::discovery::models::GameCandidate;
 
 pub fn add_discovered_game(conn: &Connection, candidate: &GameCandidate) -> Result<i64> {
-    let normalized_name = candidate.name.to_lowercase().replace(' ', "");
+    let normalized_name = normalize_name(&candidate.name);
 
+    // Prefer a game still in the library over one that was removed.
     let existing_id: Option<i64> = conn
         .query_row(
-            "SELECT id FROM games WHERE normalized_name = ?1",
+            "SELECT id FROM games WHERE normalized_name = ?1 ORDER BY is_removed, id LIMIT 1",
             rusqlite::params![normalized_name],
             |r| r.get(0),
         )
         .optional()?;
 
     let game_id = if let Some(id) = existing_id {
+        // Adding a game by hand brings it back if it had been removed.
+        conn.execute(
+            "UPDATE games SET is_removed = 0, current_install_status = 'Installed', updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![id, chrono::Utc::now()],
+        )?;
         id
     } else {
         conn.execute(
-            "INSERT INTO games (name, normalized_name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO games (name, normalized_name, current_install_status, created_at, updated_at) VALUES (?1, ?2, 'Installed', ?3, ?4)",
             rusqlite::params![candidate.name, normalized_name, chrono::Utc::now(), chrono::Utc::now()]
         )?;
         conn.last_insert_rowid()
@@ -453,5 +642,81 @@ mod discovery_tests {
             .query_row("SELECT COUNT(*) FROM game_executables", [], |r| r.get(0))
             .unwrap();
         assert_eq!(exe_count, 2);
+    }
+
+    fn manual_game(name: &str) -> GameCandidate {
+        GameCandidate {
+            name: name.to_string(),
+            install_path: format!("D:/Games/{}", name),
+            executables: vec![],
+            source: "Manual".to_string(),
+            confidence: 100,
+            platform_app_id: None,
+        }
+    }
+
+    #[test]
+    fn test_normalize_name() {
+        assert_eq!(normalize_name("Cyberpunk 2077"), normalize_name("CYBERPUNK 2077™"));
+        assert_eq!(normalize_name("Baldur's Gate 3"), "baldursgate3");
+        assert_ne!(normalize_name("Hades"), normalize_name("Hades II"));
+    }
+
+    #[test]
+    fn test_adding_a_removed_game_brings_it_back() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO games (id, name, normalized_name, is_removed) VALUES (5, 'Celeste', 'celeste', 1)",
+            [],
+        )
+        .unwrap();
+
+        let id = add_discovered_game(&conn, &manual_game("Celeste")).unwrap();
+
+        assert_eq!(id, 5);
+        let removed: bool = conn
+            .query_row("SELECT is_removed FROM games WHERE id = 5", [], |r| r.get(0))
+            .unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn test_merge_duplicate_games() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO games (id, name, normalized_name, cover_path) VALUES (1, 'Cyberpunk 2077', 'cyberpunk2077', NULL);
+             INSERT INTO games (id, name, normalized_name, cover_path) VALUES (2, 'Cyberpunk 2077', 'cyberpunk 2077', 'cover.png');
+             INSERT INTO games (id, name, normalized_name, is_removed) VALUES (3, 'Cyberpunk 2077', 'cyberpunk 2077', 1);
+             INSERT INTO game_platforms (game_id, platform, external_id) VALUES (2, 'GOG', '1423049311');
+             INSERT INTO game_sessions (game_id, started_at, duration_seconds) VALUES (1, '2026-01-01 10:00:00+00:00', 60);
+             INSERT INTO game_sessions (game_id, started_at, duration_seconds) VALUES (2, '2026-01-02 10:00:00+00:00', 120);",
+        )
+        .unwrap();
+
+        assert_eq!(merge_duplicate_games(&mut conn).unwrap(), 1);
+
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM games ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids, [1, 3], "the removed copy stays separate");
+        let playtime: i64 = conn
+            .query_row("SELECT SUM(duration_seconds) FROM game_sessions WHERE game_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(playtime, 180);
+        let (platform_game, cover): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT gp.game_id, g.cover_path FROM game_platforms gp JOIN games g ON g.id = gp.game_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(platform_game, 1);
+        assert_eq!(cover.as_deref(), Some("cover.png"));
     }
 }

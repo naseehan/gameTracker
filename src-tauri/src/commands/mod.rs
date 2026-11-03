@@ -1,7 +1,9 @@
+use crate::database::editing;
 use crate::discovery::manager::DiscoveryManager;
 use crate::discovery::models::GameCandidate;
+use crate::events;
 use crate::lock;
-use crate::models::{Game, GameLibraryItem, GameSession};
+use crate::models::{GameDetection, GameLibraryItem, RecentSession, RemovedGame};
 use crate::settings;
 use crate::stats::dto::{DailyPlaytime, DashboardStats};
 use crate::stats::game_queries::{
@@ -9,21 +11,26 @@ use crate::stats::game_queries::{
     GameStatistics,
 };
 use crate::tracking::tracker::ActiveSession;
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::HashMap;
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
 // Every command is async so that Tauri runs it off the main thread; a slow command
-// never freezes the window. Commands that scan folders or read and write files also
-// move to a blocking thread with `run_blocking`.
+// never freezes the window. Commands that scan folders, show file dialogs or read and
+// write files also move to a blocking thread with `run_blocking`.
+//
+// The UI never passes file paths to read or write. Commands that work with files open
+// the file dialog themselves, so a script injected into the page couldn't use them to
+// reach arbitrary files.
 
 pub struct AppState {
+    pub app: AppHandle,
     pub db: Arc<Mutex<Connection>>,
-    pub active_processes: Arc<Mutex<HashMap<u32, String>>>,
-    pub active_games: Arc<Mutex<HashMap<u32, Game>>>,
     pub session_tracker: Arc<Mutex<crate::tracking::tracker::SessionTracker>>,
     pub detector: Arc<Mutex<crate::detection::detector::GameDetector>>,
     pub tracking_enabled: Arc<AtomicBool>,
@@ -33,10 +40,12 @@ pub struct AppState {
     /// Makes the process monitor report every running process again, so games that
     /// are already open get new sessions after tracking state was reset.
     pub monitor_resync: Arc<AtomicBool>,
+    pub cover_lookup_running: AtomicBool,
 }
 
 /// Turns a database error into a message that is safe to show in the UI.
 fn db_error(e: rusqlite::Error) -> String {
+    log::error!("Database error: {}", e);
     let msg = e.to_string();
     if msg.contains("FOREIGN KEY") {
         "Action failed due to a constraint. Your data is safe.".to_string()
@@ -47,7 +56,7 @@ fn db_error(e: rusqlite::Error) -> String {
     }
 }
 
-/// Runs slow work (folder scans, file I/O) on a blocking thread.
+/// Runs slow work (folder scans, file dialogs, file I/O) on a blocking thread.
 async fn run_blocking<T, F>(app: AppHandle, work: F) -> Result<T, String>
 where
     T: Send + 'static,
@@ -58,11 +67,11 @@ where
         .map_err(|e| e.to_string())?
 }
 
-/// Reloads the executables used for process detection. Call after any change to
-/// game_executables, or new games aren't detected and removed ones still are.
+/// Reloads the executables and install folders used for process detection. Call after
+/// any change to them, or new games aren't detected and removed ones still are.
 fn refresh_detector(state: &AppState, db: &Connection) -> Result<(), String> {
-    let execs = crate::database::get_all_executables(db).map_err(db_error)?;
-    lock(&state.detector).refresh_cache(execs);
+    let detector = crate::database::load_detector(db).map_err(db_error)?;
+    *lock(&state.detector) = detector;
     Ok(())
 }
 
@@ -88,14 +97,16 @@ pub fn load_runtime_settings(state: &AppState, db: &Connection) {
 
 /// Ends a running game's session (when the game is ignored or removed).
 fn stop_tracking_game(state: &AppState, db: &Connection, game_id: i64) {
-    let _ = lock(&state.session_tracker).end_game_session(game_id, chrono::Utc::now(), db);
-    lock(&state.active_games).retain(|_, game| game.id != game_id);
+    if let Err(e) = lock(&state.session_tracker).end_game_session(game_id, Utc::now(), db) {
+        log::error!("Failed to end the session of game {}: {}", game_id, e);
+    }
 }
 
 /// Ends every running session.
 fn stop_all_tracking(state: &AppState, db: &Connection) {
-    let _ = lock(&state.session_tracker).close_all(chrono::Utc::now(), db);
-    lock(&state.active_games).clear();
+    if let Err(e) = lock(&state.session_tracker).close_all(Utc::now(), db) {
+        log::error!("Failed to end running sessions: {}", e);
+    }
 }
 
 fn active_session(state: &AppState, game_id: i64) -> Option<ActiveSession> {
@@ -105,10 +116,8 @@ fn active_session(state: &AppState, game_id: i64) -> Option<ActiveSession> {
         .cloned()
 }
 
-fn active_elapsed_seconds(state: &AppState, game_id: i64) -> i64 {
-    active_session(state, game_id)
-        .map(|s| (chrono::Utc::now() - s.started_at).num_seconds().max(0))
-        .unwrap_or(0)
+fn picked_path(path: Option<tauri_plugin_dialog::FilePath>) -> Result<Option<PathBuf>, String> {
+    path.map(|p| p.into_path().map_err(|e| e.to_string())).transpose()
 }
 
 /// Scans the game launchers and records what they report. Only the final write holds
@@ -118,72 +127,65 @@ pub fn run_discovery(state: &AppState) -> Result<Vec<GameCandidate>, String> {
     let enabled = manager.enabled_providers(&lock(&state.db));
     let scan = manager.scan(&enabled);
 
-    let mut db = lock(&state.db);
-    manager.apply(&mut db, &scan)?;
-    refresh_detector(state, &db)?;
+    {
+        let mut db = lock(&state.db);
+        manager.apply(&mut db, &scan)?;
+        refresh_detector(state, &db)?;
+    }
+    events::library_changed(&state.app);
+    crate::covers::spawn_cover_lookup(state.app.clone());
     Ok(scan.candidates)
 }
 
-#[tauri::command]
-pub async fn get_games(state: State<'_, AppState>) -> Result<Vec<Game>, String> {
-    let db = lock(&state.db);
-    let mut stmt = db
-        .prepare("SELECT id, name, normalized_name, cover_path, created_at, updated_at, first_seen_at, last_seen_at, first_played_at, last_played_at, current_install_status, is_ignored, is_removed FROM games WHERE is_removed = 0 ORDER BY last_played_at DESC")
-        .map_err(db_error)?;
-
-    let games = stmt
-        .query_map([], |row| {
-            Ok(Game {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                normalized_name: row.get(2)?,
-                cover_path: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                first_seen_at: row.get(6)?,
-                last_seen_at: row.get(7)?,
-                first_played_at: row.get(8)?,
-                last_played_at: row.get(9)?,
-                current_install_status: row.get(10)?,
-                is_ignored: row.get(11)?,
-                is_removed: row.get(12)?,
-            })
-        })
-        .map_err(db_error)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(db_error)?;
-
-    Ok(games)
-}
-
-#[tauri::command]
-pub async fn get_active_processes(
-    state: State<'_, AppState>,
-) -> Result<HashMap<u32, String>, String> {
-    Ok(lock(&state.active_processes).clone())
-}
-
-#[tauri::command]
-pub async fn get_detected_games(state: State<'_, AppState>) -> Result<Vec<Game>, String> {
-    Ok(lock(&state.active_games).values().cloned().collect())
+/// A running session with its game's name and cover, for "now playing" displays.
+#[derive(Serialize)]
+pub struct ActiveSessionInfo {
+    pub session_id: i64,
+    pub game_id: i64,
+    pub game_name: String,
+    pub cover_path: Option<String>,
+    pub started_at: DateTime<Utc>,
 }
 
 #[tauri::command]
 pub async fn get_active_sessions(
     state: State<'_, AppState>,
-) -> Result<Vec<ActiveSession>, String> {
-    Ok(lock(&state.session_tracker)
+) -> Result<Vec<ActiveSessionInfo>, String> {
+    let sessions: Vec<ActiveSession> = lock(&state.session_tracker)
         .active_sessions
         .values()
         .cloned()
-        .collect())
+        .collect();
+    let db = lock(&state.db);
+    let mut infos = Vec::new();
+    for session in sessions {
+        let game: Option<(String, Option<String>)> = db
+            .query_row(
+                "SELECT name, cover_path FROM games WHERE id = ?1",
+                [session.game_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some((game_name, cover_path)) = game {
+            infos.push(ActiveSessionInfo {
+                session_id: session.session_id,
+                game_id: session.game_id,
+                game_name,
+                cover_path,
+                started_at: session.started_at,
+            });
+        }
+    }
+    infos.sort_by_key(|s| s.started_at);
+    Ok(infos)
 }
 
 #[tauri::command]
 pub async fn get_recent_sessions(
     state: State<'_, AppState>,
     limit: u32,
-) -> Result<Vec<GameSession>, String> {
+) -> Result<Vec<RecentSession>, String> {
     crate::database::get_recent_sessions(&lock(&state.db), limit).map_err(db_error)
 }
 
@@ -209,7 +211,7 @@ pub async fn get_game_details(
     let mut game = games
         .into_iter()
         .find(|g| g.id == game_id)
-        .ok_or("Game not found".to_string())?;
+        .ok_or("This game isn't in your library anymore.".to_string())?;
     game.currently_playing = active_session(&state, game_id).is_some();
 
     Ok(game)
@@ -220,8 +222,8 @@ pub async fn get_game_stats(
     state: State<'_, AppState>,
     game_id: i64,
 ) -> Result<GameStatistics, String> {
-    let active_elapsed = active_elapsed_seconds(&state, game_id);
-    get_game_statistics(&lock(&state.db), game_id, active_elapsed)
+    let active_start = active_session(&state, game_id).map(|s| s.started_at);
+    get_game_statistics(&lock(&state.db), game_id, active_start)
 }
 
 #[tauri::command]
@@ -230,8 +232,8 @@ pub async fn get_game_history(
     game_id: i64,
     days: i64,
 ) -> Result<Vec<DailyPlaytime>, String> {
-    let active_elapsed = active_elapsed_seconds(&state, game_id);
-    get_game_playtime_history(&lock(&state.db), game_id, days, active_elapsed)
+    let active_start = active_session(&state, game_id).map(|s| s.started_at);
+    get_game_playtime_history(&lock(&state.db), game_id, days, active_start)
 }
 
 #[tauri::command]
@@ -260,18 +262,57 @@ pub async fn get_dashboard_stats(
         .map_err(db_error)
 }
 
+/// Lets the user pick a folder and scans it for games. Returns None if they cancel.
 #[tauri::command]
-pub async fn scan_folder(path: String) -> Result<Vec<GameCandidate>, String> {
-    tauri::async_runtime::spawn_blocking(move || crate::discovery::scanner::scan_folder(&path))
-        .await
-        .map_err(|e| e.to_string())
+pub async fn pick_and_scan_folder(app: AppHandle) -> Result<Option<Vec<GameCandidate>>, String> {
+    run_blocking(app, |state| {
+        let folder = state
+            .app
+            .dialog()
+            .file()
+            .set_title("Choose a folder with games")
+            .blocking_pick_folder();
+        Ok(picked_path(folder)?
+            .map(|folder| crate::discovery::scanner::scan_folder(&folder.to_string_lossy())))
+    })
+    .await
+}
+
+/// Lets the user pick a folder, for typing into a form. Returns None if they cancel.
+#[tauri::command]
+pub async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
+    run_blocking(app, |state| {
+        let folder = state.app.dialog().file().blocking_pick_folder();
+        Ok(picked_path(folder)?.map(|p| p.to_string_lossy().to_string()))
+    })
+    .await
+}
+
+/// Lets the user pick an executable, for typing into a form. Returns None if they cancel.
+#[tauri::command]
+pub async fn pick_executable(app: AppHandle) -> Result<Option<String>, String> {
+    run_blocking(app, |state| {
+        let file = state
+            .app
+            .dialog()
+            .file()
+            .add_filter("Programs", &["exe"])
+            .blocking_pick_file();
+        Ok(picked_path(file)?.map(|p| p.to_string_lossy().to_string()))
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn add_game(state: State<'_, AppState>, candidate: GameCandidate) -> Result<i64, String> {
-    let db = lock(&state.db);
-    let game_id = crate::database::add_discovered_game(&db, &candidate).map_err(db_error)?;
-    refresh_detector(&state, &db)?;
+    let game_id = {
+        let db = lock(&state.db);
+        let game_id = crate::database::add_discovered_game(&db, &candidate).map_err(db_error)?;
+        refresh_detector(&state, &db)?;
+        game_id
+    };
+    events::library_changed(&state.app);
+    crate::covers::spawn_cover_lookup(state.app.clone());
     Ok(game_id)
 }
 
@@ -307,6 +348,7 @@ pub async fn update_setting(
             state.monitor_resync.store(true, Ordering::SeqCst);
         } else {
             stop_all_tracking(&state, &db);
+            events::sessions_changed(&state.app);
         }
     }
 
@@ -319,34 +361,60 @@ pub async fn set_game_ignored(
     game_id: i64,
     is_ignored: bool,
 ) -> Result<(), String> {
-    let db = lock(&state.db);
-    settings::set_game_ignored(&db, game_id, is_ignored).map_err(db_error)?;
-
-    if is_ignored {
-        stop_tracking_game(&state, &db, game_id);
-    } else {
-        // Start tracking the game if it's running right now.
-        state.monitor_resync.store(true, Ordering::SeqCst);
+    {
+        let db = lock(&state.db);
+        settings::set_game_ignored(&db, game_id, is_ignored).map_err(db_error)?;
+        if is_ignored {
+            stop_tracking_game(&state, &db, game_id);
+        } else {
+            // Start tracking the game if it's running right now.
+            state.monitor_resync.store(true, Ordering::SeqCst);
+        }
     }
+    events::library_changed(&state.app);
+    events::sessions_changed(&state.app);
     Ok(())
 }
 
+/// Saves all data to a JSON file the user picks. Returns false if they cancel.
 #[tauri::command]
-pub async fn export_data(app: AppHandle, path: String) -> Result<(), String> {
-    run_blocking(app, move |state| {
+pub async fn export_data(app: AppHandle) -> Result<bool, String> {
+    run_blocking(app, |state| {
+        let file = state
+            .app
+            .dialog()
+            .file()
+            .add_filter("JSON", &["json"])
+            .set_file_name("gametracker_export.json")
+            .blocking_save_file();
+        let Some(path) = picked_path(file)? else {
+            return Ok(false);
+        };
         let data = crate::data::export_all_data(&lock(&state.db)).map_err(db_error)?;
         let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
-        std::fs::write(&path, json).map_err(|e| e.to_string())
+        std::fs::write(&path, json).map_err(|e| format!("Couldn't save the file: {}", e))?;
+        log::info!("Exported data to {}", path.display());
+        Ok(true)
     })
     .await
 }
 
+/// Replaces all data with a JSON export the user picks. Returns false if they cancel.
 #[tauri::command]
-pub async fn import_data(app: AppHandle, path: String) -> Result<(), String> {
-    run_blocking(app, move |state| {
-        let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        let data: crate::data::ExportData =
-            serde_json::from_str(&json).map_err(|e| e.to_string())?;
+pub async fn import_data(app: AppHandle) -> Result<bool, String> {
+    let imported = run_blocking(app.clone(), |state| {
+        let file = state
+            .app
+            .dialog()
+            .file()
+            .add_filter("JSON", &["json"])
+            .blocking_pick_file();
+        let Some(path) = picked_path(file)? else {
+            return Ok(false);
+        };
+        let json = std::fs::read_to_string(&path).map_err(|e| format!("Couldn't read the file: {}", e))?;
+        let data: crate::data::ExportData = serde_json::from_str(&json)
+            .map_err(|e| format!("That file isn't a GameTracker export: {}", e))?;
 
         let mut db = lock(&state.db);
         // Close running sessions first: their rows are about to be replaced, and a
@@ -359,41 +427,73 @@ pub async fn import_data(app: AppHandle, path: String) -> Result<(), String> {
 
         // Games that are still running get new sessions.
         state.monitor_resync.store(true, Ordering::SeqCst);
-        result
+        result.map(|_| true)
     })
-    .await
+    .await?;
+    if imported {
+        events::library_changed(&app);
+        events::sessions_changed(&app);
+    }
+    Ok(imported)
 }
 
 #[tauri::command]
 pub async fn delete_all_history(state: State<'_, AppState>) -> Result<(), String> {
-    let db = lock(&state.db);
-    stop_all_tracking(&state, &db);
-    crate::data::delete_all_history(&db).map_err(db_error)?;
+    {
+        let db = lock(&state.db);
+        stop_all_tracking(&state, &db);
+        crate::data::delete_all_history(&db).map_err(db_error)?;
+    }
     // Games that are still running get new sessions.
     state.monitor_resync.store(true, Ordering::SeqCst);
+    events::library_changed(&state.app);
+    events::sessions_changed(&state.app);
     Ok(())
 }
 
 #[tauri::command]
 pub async fn reset_application(state: State<'_, AppState>) -> Result<(), String> {
-    let mut db = lock(&state.db);
-    stop_all_tracking(&state, &db);
-    crate::data::reset_application(&mut db).map_err(db_error)?;
-    refresh_detector(&state, &db)?;
-    load_runtime_settings(&state, &db);
+    {
+        let mut db = lock(&state.db);
+        stop_all_tracking(&state, &db);
+        crate::data::reset_application(&mut db).map_err(db_error)?;
+        refresh_detector(&state, &db)?;
+        load_runtime_settings(&state, &db);
+    }
+    if let Ok(dir) = state.app.path().app_data_dir() {
+        let _ = std::fs::remove_dir_all(dir.join("covers"));
+    }
+    events::library_changed(&state.app);
+    events::sessions_changed(&state.app);
     Ok(())
 }
 
 const COVER_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
 
+/// Lets the user pick an image as a game's cover. Returns the new cover's path, or
+/// None if they cancel.
 #[tauri::command]
-pub async fn set_game_cover(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    game_id: i64,
-    source_path: String,
-) -> Result<String, String> {
-    let source = PathBuf::from(&source_path);
+pub async fn choose_game_cover(app: AppHandle, game_id: i64) -> Result<Option<String>, String> {
+    let cover = run_blocking(app.clone(), move |state| {
+        let file = state
+            .app
+            .dialog()
+            .file()
+            .add_filter("Images", &COVER_EXTENSIONS)
+            .blocking_pick_file();
+        let Some(source) = picked_path(file)? else {
+            return Ok(None);
+        };
+        set_game_cover(state, game_id, &source).map(Some)
+    })
+    .await?;
+    if cover.is_some() {
+        events::library_changed(&app);
+    }
+    Ok(cover)
+}
+
+fn set_game_cover(state: &AppState, game_id: i64, source: &std::path::Path) -> Result<String, String> {
     let extension = source
         .extension()
         .and_then(|e| e.to_str())
@@ -401,7 +501,8 @@ pub async fn set_game_cover(
         .filter(|e| COVER_EXTENSIONS.contains(&e.as_str()))
         .ok_or("Covers must be PNG, JPG, WebP or GIF images.")?;
 
-    let covers_dir = app
+    let covers_dir = state
+        .app
         .path()
         .app_data_dir()
         .map_err(|e| e.to_string())?
@@ -412,10 +513,10 @@ pub async fn set_game_cover(
     let dest_path = covers_dir.join(format!(
         "{}-{}.{}",
         game_id,
-        chrono::Utc::now().timestamp_millis(),
+        Utc::now().timestamp_millis(),
         extension
     ));
-    std::fs::copy(&source, &dest_path).map_err(|e| format!("Failed to copy image: {}", e))?;
+    std::fs::copy(source, &dest_path).map_err(|e| format!("Failed to copy image: {}", e))?;
     let dest_path_str = dest_path.to_string_lossy().to_string();
 
     let previous_cover: Option<String> = {
@@ -458,31 +559,218 @@ pub async fn remove_game_from_library(
     game_id: i64,
     delete_history: bool,
 ) -> Result<(), String> {
-    let db = lock(&state.db);
+    {
+        let db = lock(&state.db);
 
-    // First, close active session if this game is currently running
-    stop_tracking_game(&state, &db, game_id);
+        // First, close active session if this game is currently running
+        stop_tracking_game(&state, &db, game_id);
 
-    if delete_history {
-        // Hard delete
-        db.execute("DELETE FROM games WHERE id = ?1", rusqlite::params![game_id])
+        if delete_history {
+            // Hard delete
+            db.execute("DELETE FROM games WHERE id = ?1", rusqlite::params![game_id])
+                .map_err(db_error)?;
+        } else {
+            // Soft delete (remove from detection and UI, keep history)
+            db.execute("UPDATE games SET is_removed = 1, current_install_status = 'Not Installed' WHERE id = ?1", rusqlite::params![game_id])
+                .map_err(db_error)?;
+            // Remove tracking mappings so it's not accidentally tracked
+            db.execute(
+                "DELETE FROM game_executables WHERE game_id = ?1",
+                rusqlite::params![game_id],
+            )
             .map_err(db_error)?;
-    } else {
-        // Soft delete (remove from detection and UI, keep history)
-        db.execute("UPDATE games SET is_removed = 1, current_install_status = 'Not Installed' WHERE id = ?1", rusqlite::params![game_id])
+            db.execute(
+                "DELETE FROM game_installations WHERE game_id = ?1",
+                rusqlite::params![game_id],
+            )
             .map_err(db_error)?;
-        // Remove tracking mappings so it's not accidentally tracked
-        db.execute(
-            "DELETE FROM game_executables WHERE game_id = ?1",
-            rusqlite::params![game_id],
-        )
-        .map_err(db_error)?;
-        db.execute(
-            "DELETE FROM game_installations WHERE game_id = ?1",
-            rusqlite::params![game_id],
-        )
-        .map_err(db_error)?;
+        }
+
+        refresh_detector(&state, &db)?;
     }
+    events::library_changed(&state.app);
+    events::sessions_changed(&state.app);
+    Ok(())
+}
 
-    refresh_detector(&state, &db)
+#[tauri::command]
+pub async fn rename_game(state: State<'_, AppState>, game_id: i64, name: String) -> Result<(), String> {
+    editing::rename_game(&lock(&state.db), game_id, &name)?;
+    events::library_changed(&state.app);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_session(
+    state: State<'_, AppState>,
+    session_id: i64,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+) -> Result<(), String> {
+    editing::update_session(&lock(&state.db), session_id, started_at, ended_at)?;
+    events::sessions_changed(&state.app);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_session(state: State<'_, AppState>, session_id: i64) -> Result<(), String> {
+    editing::delete_session(&lock(&state.db), session_id)?;
+    events::sessions_changed(&state.app);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_game_detection(state: State<'_, AppState>, game_id: i64) -> Result<GameDetection, String> {
+    editing::get_game_detection(&lock(&state.db), game_id)
+}
+
+/// Lets the user pick an executable that belongs to a game. Returns false if they cancel.
+#[tauri::command]
+pub async fn add_game_executable(app: AppHandle, game_id: i64) -> Result<bool, String> {
+    let added = run_blocking(app.clone(), move |state| {
+        let file = state
+            .app
+            .dialog()
+            .file()
+            .add_filter("Programs", &["exe"])
+            .blocking_pick_file();
+        let Some(path) = picked_path(file)? else {
+            return Ok(false);
+        };
+        let db = lock(&state.db);
+        editing::add_executable(&db, game_id, &path)?;
+        refresh_detector(state, &db)?;
+        Ok(true)
+    })
+    .await?;
+    if added {
+        events::library_changed(&app);
+    }
+    Ok(added)
+}
+
+#[tauri::command]
+pub async fn remove_game_executable(state: State<'_, AppState>, executable_id: i64) -> Result<(), String> {
+    {
+        let db = lock(&state.db);
+        editing::remove_executable(&db, executable_id)?;
+        refresh_detector(&state, &db)?;
+    }
+    events::library_changed(&state.app);
+    Ok(())
+}
+
+/// Lets the user pick a folder the game is installed in. Returns false if they cancel.
+#[tauri::command]
+pub async fn add_game_install_folder(app: AppHandle, game_id: i64) -> Result<bool, String> {
+    let added = run_blocking(app.clone(), move |state| {
+        let folder = state.app.dialog().file().blocking_pick_folder();
+        let Some(path) = picked_path(folder)? else {
+            return Ok(false);
+        };
+        let db = lock(&state.db);
+        editing::add_install_folder(&db, game_id, &path)?;
+        refresh_detector(state, &db)?;
+        Ok(true)
+    })
+    .await?;
+    if added {
+        events::library_changed(&app);
+    }
+    Ok(added)
+}
+
+#[tauri::command]
+pub async fn remove_game_install_folder(state: State<'_, AppState>, install_id: i64) -> Result<(), String> {
+    {
+        let db = lock(&state.db);
+        editing::remove_install_folder(&db, install_id)?;
+        refresh_detector(&state, &db)?;
+    }
+    events::library_changed(&state.app);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_removed_games(state: State<'_, AppState>) -> Result<Vec<RemovedGame>, String> {
+    editing::get_removed_games(&lock(&state.db))
+}
+
+/// Puts a removed game back, then runs discovery so launcher games get their install
+/// folder back and are tracked again.
+#[tauri::command]
+pub async fn restore_game(app: AppHandle, game_id: i64) -> Result<(), String> {
+    editing::restore_game(&lock(&app.state::<AppState>().db), game_id)?;
+    events::library_changed(&app);
+    let discovery_app = app.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = run_discovery(&discovery_app.state::<AppState>()) {
+            log::error!("Discovery after restoring a game failed: {}", e);
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn has_steamgriddb_key() -> Result<bool, String> {
+    Ok(crate::covers::steamgriddb_key().is_some())
+}
+
+/// Saves the SteamGridDB API key (an empty key removes it) and looks covers up again.
+#[tauri::command]
+pub async fn set_steamgriddb_key(state: State<'_, AppState>, key: String) -> Result<(), String> {
+    let entry = crate::auth::get_keyring_entry(crate::covers::STEAMGRIDDB_KEY_ENTRY)?;
+    let key = key.trim();
+    if key.is_empty() {
+        match entry.delete_credential() {
+            Ok(_) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(format!("Couldn't remove the key: {}", e)),
+        }
+    } else {
+        entry
+            .set_password(key)
+            .map_err(|e| format!("Couldn't save the key: {}", e))?;
+        crate::covers::reset_lookups(&lock(&state.db)).map_err(db_error)?;
+        crate::covers::spawn_cover_lookup(state.app.clone());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn open_log_folder(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    app.opener()
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_update_status(app: AppHandle) -> Result<crate::updates::UpdateStatus, String> {
+    crate::updates::check(&app).await
+}
+
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> Result<(), String> {
+    crate::updates::install(&app).await
+}
+
+/// Whether the app is registered to start (in the tray) when the user signs in to Windows.
+#[tauri::command]
+pub async fn get_autostart_enabled(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let autostart = app.autolaunch();
+    let result = if enabled {
+        autostart.enable()
+    } else {
+        autostart.disable()
+    };
+    result.map_err(|e| e.to_string())
 }

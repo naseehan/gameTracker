@@ -39,8 +39,8 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       
       const games = await invoke<GameLibraryItem[]>('get_library');
       set({ games, isLoading: false });
-    } catch (err: any) {
-      set({ error: err.toString(), isLoading: false });
+    } catch (err) {
+      set({ error: String(err), isLoading: false });
     }
   },
   
@@ -67,9 +67,10 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     
     if (filterBy !== 'all') {
       if (filterBy === 'installed') {
-        result = result.filter(g => g.current_install_status === 'Installed');
+        // Games added by hand have an unknown status; they count as installed, like on their cards.
+        result = result.filter(g => g.current_install_status !== 'Not Installed');
       } else if (filterBy === 'not_installed') {
-        result = result.filter(g => g.current_install_status !== 'Installed');
+        result = result.filter(g => g.current_install_status === 'Not Installed');
       } else if (filterBy === 'currently_playing') {
         result = result.filter(g => g.currently_playing);
       } else if (filterBy === 'ignored') {

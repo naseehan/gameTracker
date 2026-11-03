@@ -1,97 +1,137 @@
-use chrono::{DateTime, Duration, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::dto::{DailyPlaytime, DashboardStats, DayOfWeekActivity, TopGame};
+use super::time::{
+    bucket_labels, bucket_label, days_ago_start, overlap_seconds, split_by_bucket, today_start,
+    Bucket,
+};
 use crate::tracking::tracker::ActiveSession;
+
+/// A stretch of play: a finished session from the database or one that's running now.
+struct PlayInterval {
+    game_id: i64,
+    name: String,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+}
+
+/// Finished sessions that end at or after `since`. Running sessions also have an open
+/// row in the database; they're left out here and taken from the tracker instead, so
+/// each one is counted exactly once.
+fn finished_sessions(db: &Connection, since: DateTime<Utc>) -> rusqlite::Result<Vec<PlayInterval>> {
+    let mut stmt = db.prepare(
+        "SELECT s.game_id, g.name, s.started_at, s.ended_at
+         FROM game_sessions s JOIN games g ON g.id = s.game_id
+         WHERE s.ended_at IS NOT NULL AND s.ended_at >= ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![since], |row| {
+        Ok(PlayInterval {
+            game_id: row.get(0)?,
+            name: row.get(1)?,
+            start: row.get(2)?,
+            end: row.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn running_sessions(
+    db: &Connection,
+    active_sessions: &[ActiveSession],
+    now: DateTime<Utc>,
+) -> Vec<PlayInterval> {
+    active_sessions
+        .iter()
+        .map(|session| PlayInterval {
+            game_id: session.game_id,
+            name: db
+                .query_row(
+                    "SELECT name FROM games WHERE id = ?1",
+                    [session.game_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default(),
+            start: session.started_at,
+            end: now,
+        })
+        .collect()
+}
 
 pub fn get_dashboard_stats(
     db: &Connection,
     active_sessions: &[ActiveSession],
     time_range: &str, // "7d", "30d", "all", "today"
 ) -> rusqlite::Result<DashboardStats> {
-    let now_utc = Utc::now();
-    let now_local = Local::now();
+    let now = Utc::now();
+    let today = today_start();
+    let week_start = days_ago_start(6);
 
-    // Calculate start of today (local time midnight, converted to UTC)
-    let start_of_today_local = now_local
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_local_timezone(Local)
-        .unwrap();
-    let start_of_today_utc = start_of_today_local.with_timezone(&Utc);
-
-    // Start of 7 days ago (including today)
-    let start_of_week_utc = (start_of_today_local - Duration::days(6)).with_timezone(&Utc);
-
-    // Global aggregations from SQL
-    let total_playtime_sql: i64 = db.query_row(
-        "SELECT COALESCE(SUM(duration_seconds), 0) FROM game_sessions",
-        [],
-        |r| r.get(0),
-    )?;
-
-    let mut total_sessions_sql: i64 =
-        db.query_row("SELECT COUNT(*) FROM game_sessions", [], |r| r.get(0))?;
-
-    // Aggregate active sessions globally
-    let mut active_playtime_total = 0;
-    let mut active_game_additions: HashMap<i64, i64> = HashMap::new(); // game_id -> duration
-
-    for session in active_sessions {
-        let elapsed = (now_utc - session.started_at).num_seconds().max(0);
-        active_playtime_total += elapsed;
-        *active_game_additions.entry(session.game_id).or_insert(0) += elapsed;
-        // active sessions count as sessions too
-        total_sessions_sql += 1;
+    let since = match time_range {
+        "today" => today.min(week_start),
+        "7d" => week_start,
+        "30d" => days_ago_start(29),
+        _ => Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap(),
+    };
+    let mut sessions = finished_sessions(db, since)?;
+    sessions.extend(running_sessions(db, active_sessions, now));
+    for session in &mut sessions {
+        session.end = session.end.min(now);
     }
 
-    let total_playtime_seconds = total_playtime_sql + active_playtime_total;
+    let (range_start, bucket) = match time_range {
+        "today" => (today, Bucket::Hour),
+        "7d" => (week_start, Bucket::Day),
+        "30d" => (days_ago_start(29), Bucket::Day),
+        _ => {
+            let first = sessions.iter().map(|s| s.start).min().unwrap_or(today);
+            let first_day = super::time::local_day_start(first.with_timezone(&Local).date_naive())
+                .with_timezone(&Utc);
+            // Long histories are shown per month so the chart stays readable.
+            let bucket = if now - first_day > Duration::days(90) {
+                Bucket::Month
+            } else {
+                Bucket::Day
+            };
+            (first_day, bucket)
+        }
+    };
 
-    // Fetch all games' playtime for Top Games and Games Played
-    let mut stmt = db.prepare(
-        "
-        SELECT s.game_id, g.name, COALESCE(SUM(s.duration_seconds), 0)
-        FROM game_sessions s
-        JOIN games g ON s.game_id = g.id
-        GROUP BY s.game_id
-    ",
-    )?;
-
+    let mut buckets: BTreeMap<String, i64> = bucket_labels(range_start, now, bucket)
+        .into_iter()
+        .map(|label| (label, 0))
+        .collect();
+    let dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let mut dow_seconds = [0i64; 7];
     let mut game_playtimes: HashMap<i64, (String, i64)> = HashMap::new();
-    let rows = stmt.query_map([], |row| {
-        let game_id: i64 = row.get(0)?;
-        let name: String = row.get(1)?;
-        let duration: i64 = row.get(2)?;
-        Ok((game_id, name, duration))
-    })?;
+    let mut total_sessions = 0;
+    let mut today_playtime_seconds = 0;
+    let mut week_playtime_seconds = 0;
 
-    for row in rows {
-        if let Ok((game_id, name, duration)) = row {
-            game_playtimes.insert(game_id, (name, duration));
+    for session in &sessions {
+        today_playtime_seconds += overlap_seconds(session.start, session.end, today, now);
+        week_playtime_seconds += overlap_seconds(session.start, session.end, week_start, now);
+
+        let in_range = overlap_seconds(session.start, session.end, range_start, now);
+        if in_range == 0 {
+            continue;
         }
+        total_sessions += 1;
+        game_playtimes
+            .entry(session.game_id)
+            .or_insert_with(|| (session.name.clone(), 0))
+            .1 += in_range;
+
+        let clipped_start = session.start.max(range_start);
+        split_by_bucket(clipped_start, session.end, bucket, |piece, seconds| {
+            *buckets.entry(bucket_label(piece, bucket)).or_insert(0) += seconds;
+        });
+        split_by_bucket(clipped_start, session.end, Bucket::Day, |piece, seconds| {
+            dow_seconds[piece.weekday().num_days_from_monday() as usize] += seconds;
+        });
     }
 
-    // Add active playtime to the game playtimes map
-    for (game_id, active_duration) in &active_game_additions {
-        if let Some(entry) = game_playtimes.get_mut(game_id) {
-            entry.1 += active_duration;
-        } else {
-            // If the game has no completed sessions, we need its name
-            if let Ok(Some(name)) =
-                db.query_row("SELECT name FROM games WHERE id = ?1", [game_id], |r| {
-                    r.get(0)
-                })
-            {
-                game_playtimes.insert(*game_id, (name, *active_duration));
-            }
-        }
-    }
-
-    let games_played = game_playtimes.len() as i64;
-
-    // Sort games by playtime to find Most Played and Top Games
     let mut sorted_games: Vec<TopGame> = game_playtimes
         .into_iter()
         .map(|(game_id, (name, playtime_seconds))| TopGame {
@@ -100,163 +140,126 @@ pub fn get_dashboard_stats(
             playtime_seconds,
         })
         .collect();
-
     sorted_games.sort_by(|a, b| b.playtime_seconds.cmp(&a.playtime_seconds));
 
-    let most_played_game = sorted_games.first().map(|g| g.name.clone());
-    let most_played_game_playtime = sorted_games
-        .first()
-        .map(|g| g.playtime_seconds)
-        .unwrap_or(0);
-
-    let top_games = sorted_games.into_iter().take(5).collect();
-
-    // Fetch sessions for the time range (Today, Week, or selected range)
-    // We'll fetch from the maximum range we need (start of week OR the selected range)
-    let range_start_utc = match time_range {
-        "today" => start_of_today_utc,
-        "7d" => start_of_week_utc,
-        "30d" => (start_of_today_local - Duration::days(29)).with_timezone(&Utc),
-        _ => Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap(), // "all"
-    };
-
-    // Calculate Today and Week playtimes specifically
-    let mut today_playtime_seconds = 0;
-    let mut week_playtime_seconds = 0;
-
-    // We'll also bucket for the chart
-    let mut daily_buckets: HashMap<String, i64> = HashMap::new();
-    let mut dow_buckets: HashMap<String, i64> = HashMap::new();
-
-    // Fill days with 0 for the selected range to prevent misleading zeros
-    let days_to_fill = match time_range {
-        "today" => 1,
-        "7d" => 7,
-        "30d" => 30,
-        _ => 0, // "all" will just show days that have data, or we could calculate diff
-    };
-
-    if days_to_fill > 0 {
-        for i in 0..days_to_fill {
-            let d = start_of_today_local - Duration::days(i as i64);
-            let label = d.format("%Y-%m-%d").to_string();
-            daily_buckets.insert(label, 0);
-        }
-    }
-
-    // Initialize DOW buckets
-    let dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    for name in &dow_names {
-        dow_buckets.insert(name.to_string(), 0);
-    }
-
-    // Process completed sessions
-    let mut session_stmt = db
-        .prepare("SELECT started_at, duration_seconds FROM game_sessions WHERE started_at >= ?1")?;
-
-    // For calculating global today/week metrics, we use the furthest lookback needed
-    let metrics_start = if range_start_utc < start_of_week_utc {
-        range_start_utc
-    } else {
-        start_of_week_utc
-    };
-
-    let session_rows = session_stmt.query_map(rusqlite::params![metrics_start], |row| {
-        let started_utc: DateTime<Utc> = row.get(0)?;
-        let duration: i64 = row.get(1)?;
-        Ok((started_utc, duration))
-    })?;
-
-    for row in session_rows {
-        if let Ok((started_utc, duration)) = row {
-            if started_utc >= start_of_today_utc {
-                today_playtime_seconds += duration;
-            }
-            if started_utc >= start_of_week_utc {
-                week_playtime_seconds += duration;
-            }
-
-            if started_utc >= range_start_utc || time_range == "all" {
-                let local_start = started_utc.with_timezone(&Local);
-                let day_label = local_start.format("%Y-%m-%d").to_string();
-                let dow_label = local_start.format("%a").to_string();
-
-                *daily_buckets.entry(day_label).or_insert(0) += duration;
-                *dow_buckets.entry(dow_label).or_insert(0) += duration;
-            }
-        }
-    }
-
-    // Add active sessions to time buckets
-    for session in active_sessions {
-        let elapsed = (now_utc - session.started_at).num_seconds().max(0);
-
-        if session.started_at >= start_of_today_utc {
-            today_playtime_seconds += elapsed;
-        }
-        if session.started_at >= start_of_week_utc {
-            week_playtime_seconds += elapsed;
-        }
-
-        if session.started_at >= range_start_utc || time_range == "all" {
-            let local_start = session.started_at.with_timezone(&Local);
-            let day_label = local_start.format("%Y-%m-%d").to_string();
-            let dow_label = local_start.format("%a").to_string();
-
-            *daily_buckets.entry(day_label).or_insert(0) += elapsed;
-            *dow_buckets.entry(dow_label).or_insert(0) += elapsed;
-        }
-    }
-
-    // Format chart data
-    let mut playtime_over_time: Vec<DailyPlaytime> = daily_buckets
-        .into_iter()
-        .map(|(date_label, playtime_seconds)| DailyPlaytime {
-            date_label,
-            playtime_seconds,
-        })
-        .collect();
-    playtime_over_time.sort_by(|a, b| a.date_label.cmp(&b.date_label));
-
-    let mut activity_by_day_of_week: Vec<DayOfWeekActivity> = Vec::new();
-    for name in &dow_names {
-        activity_by_day_of_week.push(DayOfWeekActivity {
-            day: name.to_string(),
-            playtime_seconds: *dow_buckets.get(*name).unwrap_or(&0),
-        });
-    }
-
     Ok(DashboardStats {
-        total_playtime_seconds,
-        games_played,
-        total_sessions: total_sessions_sql,
+        total_playtime_seconds: sorted_games.iter().map(|g| g.playtime_seconds).sum(),
+        games_played: sorted_games.len() as i64,
+        total_sessions,
         today_playtime_seconds,
         week_playtime_seconds,
-        most_played_game,
-        most_played_game_playtime,
-        playtime_over_time,
-        top_games,
-        activity_by_day_of_week,
+        most_played_game: sorted_games.first().map(|g| g.name.clone()),
+        most_played_game_playtime: sorted_games.first().map_or(0, |g| g.playtime_seconds),
+        playtime_over_time: buckets
+            .into_iter()
+            .map(|(date_label, playtime_seconds)| DailyPlaytime {
+                date_label,
+                playtime_seconds,
+            })
+            .collect(),
+        top_games: sorted_games.into_iter().take(5).collect(),
+        activity_by_day_of_week: dow_names
+            .iter()
+            .zip(dow_seconds)
+            .map(|(day, playtime_seconds)| DayOfWeekActivity {
+                day: day.to_string(),
+                playtime_seconds,
+            })
+            .collect(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::run_migrations;
+    use crate::database::{create_session, run_migrations};
+    use crate::stats::time::local_day_start;
+    use std::collections::HashSet;
 
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO games (id, name, normalized_name) VALUES (1, 'Hades', 'hades')",
+            [],
+        )
+        .unwrap();
         conn
+    }
+
+    fn insert_finished(db: &Connection, start: DateTime<Utc>, end: DateTime<Utc>) {
+        db.execute(
+            "INSERT INTO game_sessions (game_id, started_at, ended_at, duration_seconds) VALUES (1, ?1, ?2, ?3)",
+            rusqlite::params![start, end, (end - start).num_seconds()],
+        )
+        .unwrap();
+    }
+
+    fn local_time(days_ago: i64, hour: i64) -> DateTime<Utc> {
+        (local_day_start(Local::now().date_naive() - Duration::days(days_ago)) + Duration::hours(hour))
+            .with_timezone(&Utc)
     }
 
     #[test]
     fn test_get_dashboard_stats_empty() {
-        let conn = setup_test_db();
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
         let stats = get_dashboard_stats(&conn, &[], "all").unwrap();
         assert_eq!(stats.total_playtime_seconds, 0);
         assert_eq!(stats.games_played, 0);
         assert_eq!(stats.total_sessions, 0);
+    }
+
+    #[test]
+    fn test_running_session_counted_once() {
+        let db = setup_test_db();
+        let started = Utc::now() - Duration::minutes(30);
+        let session_id = create_session(&db, 1, started).unwrap();
+        let active = ActiveSession {
+            session_id,
+            game_id: 1,
+            pids: HashSet::from([42]),
+            started_at: started,
+            last_heartbeat_at: started,
+        };
+
+        let stats = get_dashboard_stats(&db, &[active], "7d").unwrap();
+
+        assert_eq!(stats.total_sessions, 1);
+        assert!((1790..=1810).contains(&stats.total_playtime_seconds));
+    }
+
+    #[test]
+    fn test_totals_follow_the_selected_range() {
+        let db = setup_test_db();
+        insert_finished(&db, local_time(10, 12), local_time(10, 14));
+        insert_finished(&db, local_time(2, 12), local_time(2, 13));
+
+        let week = get_dashboard_stats(&db, &[], "7d").unwrap();
+        assert_eq!(week.total_playtime_seconds, 3600);
+        assert_eq!(week.total_sessions, 1);
+        assert_eq!(week.top_games[0].playtime_seconds, 3600);
+
+        let all = get_dashboard_stats(&db, &[], "all").unwrap();
+        assert_eq!(all.total_playtime_seconds, 3 * 3600);
+        assert_eq!(all.total_sessions, 2);
+        // Days without play are still on the chart, as zero.
+        assert_eq!(all.playtime_over_time.len(), 11);
+    }
+
+    #[test]
+    fn test_session_across_midnight_counts_on_both_days() {
+        let db = setup_test_db();
+        insert_finished(&db, local_time(3, 23), local_time(3, 25));
+
+        let stats = get_dashboard_stats(&db, &[], "7d").unwrap();
+
+        let nonzero: Vec<i64> = stats
+            .playtime_over_time
+            .iter()
+            .map(|d| d.playtime_seconds)
+            .filter(|s| *s > 0)
+            .collect();
+        assert_eq!(nonzero, [3600, 3600]);
     }
 }

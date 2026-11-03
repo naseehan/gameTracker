@@ -53,18 +53,18 @@ impl SessionTracker {
         }
     }
 
-    /// Called when a known game process starts.
+    /// Called when a known game process starts. Returns true if a new session started.
     pub fn on_game_started(
         &mut self,
         pid: u32,
         game_id: i64,
         started_at: DateTime<Utc>,
         db: &Connection,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         // Prevent duplicate sessions for the same game, but track new pids
         if let Some(session) = self.active_sessions.get_mut(&game_id) {
             session.pids.insert(pid);
-            return Ok(());
+            return Ok(false);
         }
 
         let session_id =
@@ -83,16 +83,16 @@ impl SessionTracker {
                 last_heartbeat_at: started_at,
             },
         );
-        Ok(())
+        Ok(true)
     }
 
-    /// Called when a process stops.
+    /// Called when a process stops. Returns true if that ended a session.
     pub fn on_process_stopped(
         &mut self,
         pid: u32,
         ended_at: DateTime<Utc>,
         db: &Connection,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         // Find if this pid is tracking an active session
         let mut game_to_remove = None;
         for (game_id, session) in &mut self.active_sessions {
@@ -107,9 +107,10 @@ impl SessionTracker {
         if let Some(game_id) = game_to_remove {
             if let Some(session) = self.active_sessions.remove(&game_id) {
                 session.close(session.end_time(ended_at), db)?;
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Ends a game's active session, if it has one (e.g. when the game is ignored or removed).
@@ -127,10 +128,13 @@ impl SessionTracker {
 
     /// Records that every active game is still running, so a crash loses at most one
     /// heartbeat interval. After a long gap (sleep or hibernation) the session is split:
-    /// the old one ends at its last heartbeat and a new one starts now.
-    pub fn heartbeat(&mut self, now: DateTime<Utc>, db: &Connection) -> Result<(), String> {
+    /// the old one ends at its last heartbeat and a new one starts now. Returns true if
+    /// any session was split.
+    pub fn heartbeat(&mut self, now: DateTime<Utc>, db: &Connection) -> Result<bool, String> {
+        let mut split = false;
         for session in self.active_sessions.values_mut() {
             if session.missed_heartbeats(now) {
+                split = true;
                 session.close(session.last_heartbeat_at, db)?;
                 session.session_id = database::create_session(db, session.game_id, now)
                     .map_err(|e| e.to_string())?;
@@ -141,7 +145,7 @@ impl SessionTracker {
             }
             session.last_heartbeat_at = now;
         }
-        Ok(())
+        Ok(split)
     }
 
     /// Recovers unfinished sessions from a previous crash/shutdown.

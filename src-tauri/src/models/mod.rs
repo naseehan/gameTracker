@@ -54,3 +54,36 @@ pub struct GameLibraryItem {
     pub platforms: Vec<String>,
     pub installation_paths: Vec<String>,
 }
+
+/// A finished session with its game's name and cover, for activity lists.
+#[derive(Debug, Serialize, Clone)]
+pub struct RecentSession {
+    pub id: i64,
+    pub game_id: i64,
+    pub game_name: String,
+    pub cover_path: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+    pub duration_seconds: i64,
+}
+
+/// A game the user removed from the library, which can be restored.
+#[derive(Debug, Serialize, Clone)]
+pub struct RemovedGame {
+    pub id: i64,
+    pub name: String,
+    pub total_playtime_seconds: i64,
+}
+
+/// What the app uses to recognise a game's processes.
+#[derive(Debug, Serialize, Clone)]
+pub struct GameDetection {
+    pub executables: Vec<DetectionEntry>,
+    pub install_folders: Vec<DetectionEntry>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct DetectionEntry {
+    pub id: i64,
+    pub path: String,
+}

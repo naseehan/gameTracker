@@ -1,193 +1,168 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { ArrowLeft, Play, Clock, Calendar, Monitor } from 'lucide-react';
-import { GameLibraryItem } from '../types';
-import { GameCover } from '../components/GameCover';
+import { ArrowLeft, Play, Clock, Calendar, Monitor, Trophy, MoreHorizontal, Pencil, Image, Trash2, Eye, EyeOff } from 'lucide-react';
+import { DailyPlaytime, GameLibraryItem, GameStatistics } from '../types';
 import { useNavigationStore } from '../store/navigationStore';
 import { PlaytimeChart } from '../components/statistics/PlaytimeChart';
-
-interface GameStatistics {
-  total_playtime_seconds: number;
-  total_sessions: number;
-  average_session_seconds: number;
-  longest_session_seconds: number;
-  first_played_at: string | null;
-  last_played_at: string | null;
-  played_today_seconds: number;
-  played_week_seconds: number;
-  played_month_seconds: number;
-}
-
-interface GameSessionDto {
-  session_id: number;
-  started_at: string;
-  ended_at: string | null;
-  duration_seconds: number;
-  is_active: boolean;
-}
-
-interface DailyPlaytime {
-  date_label: string;
-  playtime_seconds: number;
-}
-
-function formatDuration(seconds: number): string {
-  if (seconds === 0) return '0m';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  if (h > 0) return `${h}h ${m}m`;
-  return `${m}m`;
-}
-
-function formatShortDate(dateStr: string): string {
-  const d = new Date(dateStr);
-  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
-}
-
-function formatTime(dateStr: string): string {
-  const d = new Date(dateStr);
-  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
-}
+import { GameCover } from '../components/GameCover';
+import { SessionHistory } from '../components/game/SessionHistory';
+import { DetectionCard } from '../components/game/DetectionCard';
+import { useBackendEvent } from '../hooks/useBackendEvent';
+import { confirmWithOption } from '../store/confirmStore';
+import { toast } from '../store/toastStore';
+import { formatPlaytime, formatShortDate } from '../utils/formatters';
+import { describeError, reportError } from '../utils/errors';
 
 export function GameDetails({ gameId }: { gameId: number }) {
   const { goBack } = useNavigationStore();
   const [game, setGame] = useState<GameLibraryItem | null>(null);
   const [stats, setStats] = useState<GameStatistics | null>(null);
-  const [sessions, setSessions] = useState<GameSessionDto[]>([]);
   const [history, setHistory] = useState<DailyPlaytime[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  
+  const [notFound, setNotFound] = useState<string | null>(null);
   const [timeRange, setTimeRange] = useState<'7' | '30'>('30');
-  
+
   const fetchAll = async () => {
     try {
-      const g = await invoke<GameLibraryItem>('get_game_details', { gameId });
-      const s = await invoke<GameStatistics>('get_game_stats', { gameId });
-      const h = await invoke<DailyPlaytime[]>('get_game_history', { gameId, days: parseInt(timeRange) });
-      const sess = await invoke<GameSessionDto[]>('get_game_session_list', { gameId, limit: 10, offset: 0 });
-      
+      const [g, s, h] = await Promise.all([
+        invoke<GameLibraryItem>('get_game_details', { gameId }),
+        invoke<GameStatistics>('get_game_stats', { gameId }),
+        invoke<DailyPlaytime[]>('get_game_history', { gameId, days: parseInt(timeRange) }),
+      ]);
       setGame(g);
       setStats(s);
       setHistory(h);
-      setSessions(sess);
+      setNotFound(null);
     } catch (e) {
-      console.error(e);
-    } finally {
-      setIsLoading(false);
+      setNotFound(describeError(e));
     }
   };
 
   useEffect(() => {
     fetchAll();
-    const interval = setInterval(fetchAll, 5000); // Polling for active duration
-    return () => clearInterval(interval);
   }, [gameId, timeRange]);
+  useBackendEvent(['sessions-changed', 'library-changed'], fetchAll);
 
-  if (isLoading || !game || !stats) {
+  // While the game is running its totals grow; refresh them every minute.
+  useEffect(() => {
+    if (!game?.currently_playing) return;
+    const interval = setInterval(fetchAll, 60_000);
+    return () => clearInterval(interval);
+  }, [game?.currently_playing, timeRange]);
+
+  if (notFound) {
     return (
-      <div className="flex-1 flex items-center justify-center">
-        <div className="animate-spin w-8 h-8 border-4 border-indigo-500 border-t-transparent rounded-full"></div>
+      <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">
+        <p className="text-gray-300 mb-4">{notFound}</p>
+        <button onClick={goBack} className="px-5 py-2.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm font-medium">
+          Go back
+        </button>
       </div>
     );
   }
 
+  if (!game || !stats) {
+    return (
+      <div className="flex-1 flex items-center justify-center">
+        <div className="animate-spin w-8 h-8 border-4 border-indigo-500 border-t-transparent rounded-full" aria-label="Loading"></div>
+      </div>
+    );
+  }
+
+  const changeCover = () => {
+    invoke<string | null>('choose_game_cover', { gameId: game.id })
+      .then((cover) => cover && setGame({ ...game, cover_path: cover }))
+      .catch((e) => reportError("Couldn't change the cover", e));
+  };
+
+  const toggleTracking = async () => {
+    try {
+      await invoke('set_game_ignored', { gameId: game.id, isIgnored: !game.is_ignored });
+      setGame({ ...game, is_ignored: !game.is_ignored });
+    } catch (e) {
+      reportError("Couldn't change tracking", e);
+    }
+  };
+
+  const remove = async () => {
+    const { confirmed, checked } = await confirmWithOption({
+      title: `Remove ${game.name}?`,
+      message: 'It disappears from your library and stops being tracked. You can restore it from Settings.',
+      confirmLabel: 'Remove',
+      danger: true,
+      checkboxLabel: 'Also delete its play history (this cannot be undone)',
+    });
+    if (!confirmed) return;
+    try {
+      await invoke('remove_game_from_library', { gameId: game.id, deleteHistory: checked });
+      toast.success(`Removed ${game.name}.`);
+      goBack();
+    } catch (e) {
+      reportError("Couldn't remove the game", e);
+    }
+  };
+
   return (
     <div className="flex-1 flex flex-col overflow-y-auto">
       {/* Header Banner */}
-      <div className="relative h-64 bg-gray-900 border-b border-gray-800 flex-shrink-0">
+      <div className="relative bg-gray-900 border-b border-gray-800 flex-shrink-0">
         <div className="absolute inset-0 overflow-hidden">
           <GameCover path={game.cover_path} alt="" className="w-full h-full opacity-20 blur-sm" fallback={null} />
           <div className="absolute inset-0 bg-gradient-to-t from-gray-950 via-gray-900/60 to-transparent"></div>
         </div>
-        
-        <div className="absolute inset-0 p-8 flex items-end">
-          <div className="flex items-end space-x-6">
-            <div className="relative w-32 h-48 rounded-lg shadow-2xl overflow-hidden bg-gray-800 border border-gray-700 flex-shrink-0">
+
+        <div className="relative p-8 pt-6">
+          <button onClick={goBack} className="flex items-center text-gray-400 hover:text-white transition-colors text-sm mb-6">
+            <ArrowLeft size={16} className="mr-1" /> Back
+          </button>
+          <div className="flex items-end gap-6">
+            <button
+              onClick={changeCover}
+              className="group relative w-32 h-48 rounded-lg shadow-2xl overflow-hidden bg-gray-800 border border-gray-700 flex-shrink-0"
+              aria-label="Change cover"
+            >
               <GameCover path={game.cover_path} alt={game.name} iconSize={32} className="w-full h-full" />
-              <div 
-                className="absolute inset-0 bg-black/60 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity cursor-pointer text-sm font-medium text-white"
-                onClick={async () => {
-                  try {
-                    const { open } = await import('@tauri-apps/plugin-dialog');
-                    const filePath = await open({
-                      multiple: false,
-                      directory: false,
-                      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }]
-                    });
-                    if (filePath) {
-                      const coverPath = await invoke<string>('set_game_cover', { gameId: game.id, sourcePath: filePath });
-                      setGame({ ...game, cover_path: coverPath });
-                    }
-                  } catch (e) {
-                    console.error(e);
-                  }
-                }}
-              >
-                Change Cover
-              </div>
-            </div>
-            
-            <div className="pb-2">
-              <button onClick={goBack} className="flex items-center text-gray-400 hover:text-white transition-colors text-sm mb-4">
-                <ArrowLeft size={16} className="mr-1" /> Back
-              </button>
-              
-              <div className="flex items-center space-x-3 mb-2">
-                <h1 className="text-4xl font-bold text-white tracking-tight">{game.name}</h1>
+              <span className="absolute inset-0 bg-black/60 flex items-center justify-center opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100 transition-opacity text-sm font-medium text-white">
+                Change cover
+              </span>
+            </button>
+
+            <div className="pb-1 min-w-0 flex-1">
+              <div className="flex items-center gap-3 mb-3 flex-wrap">
+                <GameTitle game={game} onRenamed={(name) => setGame({ ...game, name })} />
                 {game.currently_playing && (
-                  <span className="px-3 py-1 bg-green-500/20 text-green-400 text-xs font-bold rounded-full border border-green-500/30 flex items-center shadow-lg shadow-green-500/20">
+                  <span className="px-3 py-1 bg-green-500/20 text-green-400 text-xs font-bold rounded-full border border-green-500/30 flex items-center">
                     <span className="w-2 h-2 rounded-full bg-green-400 mr-2 animate-pulse"></span>
                     PLAYING
                   </span>
                 )}
                 {game.is_ignored && (
                   <span className="px-3 py-1 bg-gray-800 text-gray-400 text-xs font-bold rounded-full border border-gray-700">
-                    IGNORED
+                    NOT TRACKED
                   </span>
                 )}
               </div>
-              
-              <div className="flex items-center space-x-3 mb-4">
-                <button 
-                  onClick={async () => {
-                    try {
-                      await invoke('set_game_ignored', { gameId: game.id, isIgnored: !game.is_ignored });
-                      setGame({ ...game, is_ignored: !game.is_ignored });
-                    } catch (e) {
-                      console.error(e);
-                    }
-                  }}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors border ${game.is_ignored ? "bg-indigo-600 border-indigo-500 text-white hover:bg-indigo-500" : "bg-gray-800 border-gray-700 text-gray-300 hover:bg-gray-700 hover:text-white"}`}
-                >
-                  {game.is_ignored ? 'Unignore' : 'Ignore'}
-                </button>
-                <button 
-                  onClick={async () => {
-                    if (confirm(`Remove "${game.name}" from library?`)) {
-                      try {
-                        await invoke('remove_game_from_library', { gameId: game.id, deleteHistory: false });
-                        goBack();
-                      } catch (e) {
-                        console.error(e);
-                      }
-                    }
-                  }}
-                  className="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors border border-red-900 bg-red-950/30 text-red-400 hover:bg-red-900/50 hover:text-red-300"
-                >
-                  Remove
-                </button>
-              </div>
-              <div className="flex items-center space-x-4 text-sm text-gray-300">
-                <div className="flex items-center">
+              <div className="flex items-center gap-4 text-sm text-gray-300 flex-wrap">
+                <span className="flex items-center">
                   <Monitor size={14} className="mr-1 text-gray-500" />
-                  {game.platforms && game.platforms.length > 0 ? game.platforms.join(', ') : 'Local'}
-                </div>
-                <div className="flex items-center">
-                  <span className={game.current_install_status === 'Installed' ? 'text-indigo-400 font-medium' : 'text-gray-500'}>
-                    {game.current_install_status}
-                  </span>
-                </div>
+                  {game.platforms.length > 0 ? game.platforms.join(', ') : 'Added by you'}
+                </span>
+                <span className={game.current_install_status === 'Not Installed' ? 'text-gray-500' : 'text-indigo-400 font-medium'}>
+                  {game.current_install_status === 'Not Installed' ? 'Not installed' : 'Installed'}
+                </span>
+                {stats.first_played_at && <span className="text-gray-500">First played {formatShortDate(stats.first_played_at)}</span>}
               </div>
+            </div>
+
+            <div className="flex items-center gap-2 pb-1 flex-shrink-0">
+              <button
+                onClick={toggleTracking}
+                className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium border bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700"
+                title={game.is_ignored ? 'Record playtime for this game again' : 'Stop recording playtime for this game'}
+              >
+                {game.is_ignored ? <Eye size={16} /> : <EyeOff size={16} />}
+                {game.is_ignored ? 'Track again' : "Don't track"}
+              </button>
+              <ActionsMenu onChangeCover={changeCover} onRemove={remove} />
             </div>
           </div>
         </div>
@@ -195,133 +170,166 @@ export function GameDetails({ gameId }: { gameId: number }) {
 
       {/* Content */}
       <div className="p-8 max-w-6xl mx-auto w-full space-y-8">
-        
-        {/* Insights Bar */}
-        {stats.total_playtime_seconds > 0 && (
-          <div className="flex flex-wrap gap-4">
-            <div className="bg-indigo-500/10 border border-indigo-500/20 text-indigo-200 px-4 py-3 rounded-xl text-sm flex-1 min-w-[200px]">
-              You've played <strong className="text-white">{formatDuration(stats.total_playtime_seconds)}</strong> in total.
-            </div>
-            {stats.average_session_seconds > 0 && (
-              <div className="bg-purple-500/10 border border-purple-500/20 text-purple-200 px-4 py-3 rounded-xl text-sm flex-1 min-w-[200px]">
-                Your average session is <strong className="text-white">{formatDuration(stats.average_session_seconds)}</strong>.
-              </div>
-            )}
-            {stats.longest_session_seconds > 0 && (
-              <div className="bg-blue-500/10 border border-blue-500/20 text-blue-200 px-4 py-3 rounded-xl text-sm flex-1 min-w-[200px]">
-                Longest session: <strong className="text-white">{formatDuration(stats.longest_session_seconds)}</strong>.
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Stats Grid */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-lg">
-            <div className="flex items-center text-gray-400 mb-2">
-              <Clock size={16} className="mr-2 text-indigo-400" />
-              <span className="text-sm font-medium uppercase tracking-wider">Total Playtime</span>
-            </div>
-            <div className="text-3xl font-bold text-white">{formatDuration(stats.total_playtime_seconds)}</div>
-          </div>
-          
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-lg">
-            <div className="flex items-center text-gray-400 mb-2">
-              <Play size={16} className="mr-2 text-indigo-400" />
-              <span className="text-sm font-medium uppercase tracking-wider">Sessions</span>
-            </div>
-            <div className="text-3xl font-bold text-white">{stats.total_sessions}</div>
-          </div>
-
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-lg">
-            <div className="flex items-center text-gray-400 mb-2">
-              <Calendar size={16} className="mr-2 text-indigo-400" />
-              <span className="text-sm font-medium uppercase tracking-wider">Played Today</span>
-            </div>
-            <div className="text-3xl font-bold text-white">{formatDuration(stats.played_today_seconds)}</div>
-          </div>
-
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-lg">
-            <div className="flex items-center text-gray-400 mb-2">
-              <Calendar size={16} className="mr-2 text-indigo-400" />
-              <span className="text-sm font-medium uppercase tracking-wider">Played This Week</span>
-            </div>
-            <div className="text-3xl font-bold text-white">{formatDuration(stats.played_week_seconds)}</div>
-          </div>
+        <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
+          <Stat icon={<Clock size={16} />} label="Total playtime" value={formatPlaytime(stats.total_playtime_seconds)} />
+          <Stat
+            icon={<Play size={16} />}
+            label="Sessions"
+            value={String(stats.total_sessions)}
+            detail={stats.total_sessions > 0 ? `${formatPlaytime(stats.average_session_seconds)} on average` : undefined}
+          />
+          <Stat
+            icon={<Calendar size={16} />}
+            label="Last 7 days"
+            value={formatPlaytime(stats.played_week_seconds)}
+            detail={`Today: ${formatPlaytime(stats.played_today_seconds)}`}
+          />
+          <Stat icon={<Trophy size={16} />} label="Longest session" value={formatPlaytime(stats.longest_session_seconds)} />
         </div>
 
-        {/* Chart & History Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          
           <div className="lg:col-span-2 space-y-6">
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-lg">
               <div className="flex items-center justify-between mb-6">
                 <h2 className="text-lg font-bold text-white">Playtime History</h2>
-                <div className="flex bg-gray-800 rounded-lg p-1">
-                  <button 
-                    onClick={() => setTimeRange('7')}
-                    className={`px-3 py-1 rounded text-xs font-medium transition-colors ${timeRange === '7' ? 'bg-indigo-600 text-white shadow-sm' : 'text-gray-400 hover:text-white'}`}
-                  >
-                    7D
-                  </button>
-                  <button 
-                    onClick={() => setTimeRange('30')}
-                    className={`px-3 py-1 rounded text-xs font-medium transition-colors ${timeRange === '30' ? 'bg-indigo-600 text-white shadow-sm' : 'text-gray-400 hover:text-white'}`}
-                  >
-                    30D
-                  </button>
-                </div>
-              </div>
-              <div className="h-64">
-                <PlaytimeChart data={history} />
-              </div>
-            </div>
-            
-            {game.installation_paths && game.installation_paths.length > 0 && (
-              <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-lg">
-                <h2 className="text-lg font-bold text-white mb-4">Installations</h2>
-                <div className="space-y-2">
-                  {game.installation_paths.map((p, i) => (
-                    <div key={i} className="text-sm text-gray-300 font-mono break-all bg-gray-800/50 p-3 rounded-lg border border-gray-700/50">
-                      {p}
-                    </div>
+                <div className="flex bg-gray-800 rounded-lg p-1" role="group" aria-label="Time range">
+                  {(['7', '30'] as const).map((days) => (
+                    <button
+                      key={days}
+                      onClick={() => setTimeRange(days)}
+                      aria-pressed={timeRange === days}
+                      className={`px-3 py-1 rounded text-xs font-medium transition-colors ${timeRange === days ? 'bg-indigo-600 text-white shadow-sm' : 'text-gray-400 hover:text-white'}`}
+                    >
+                      {days}D
+                    </button>
                   ))}
                 </div>
               </div>
-            )}
-          </div>
-
-          <div className="space-y-6">
-            <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-lg flex flex-col h-full max-h-[500px]">
-              <h2 className="text-lg font-bold text-white mb-4 flex-shrink-0">Session History</h2>
-              
-              <div className="flex-1 overflow-y-auto pr-2 space-y-3">
-                {sessions.length === 0 ? (
-                  <div className="text-gray-500 text-center py-8 text-sm">No sessions recorded yet.</div>
-                ) : (
-                  sessions.map(s => (
-                    <div key={s.session_id} className={`p-3 rounded-lg border ${s.is_active ? 'bg-indigo-500/10 border-indigo-500/30' : 'bg-gray-800/50 border-gray-800'}`}>
-                      <div className="flex justify-between items-start mb-1">
-                        <span className="font-medium text-gray-200 text-sm">
-                          {formatShortDate(s.started_at)}
-                        </span>
-                        <span className={`text-sm font-bold ${s.is_active ? 'text-indigo-400 animate-pulse' : 'text-gray-400'}`}>
-                          {formatDuration(s.duration_seconds)}
-                        </span>
-                      </div>
-                      <div className="flex justify-between items-center text-xs text-gray-500">
-                        <span>{formatTime(s.started_at)} {s.ended_at ? `- ${formatTime(s.ended_at)}` : ''}</span>
-                        {s.is_active && <span className="text-indigo-500 font-medium">Playing Now</span>}
-                      </div>
-                    </div>
-                  ))
-                )}
+              <div className="h-64">
+                <PlaytimeChart data={history} bare />
               </div>
             </div>
+
+            <DetectionCard gameId={game.id} />
           </div>
-          
+
+          <SessionHistory gameId={game.id} />
         </div>
       </div>
+    </div>
+  );
+}
+
+function Stat({ icon, label, value, detail }: { icon: React.ReactNode; label: string; value: string; detail?: string }) {
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-lg">
+      <div className="flex items-center text-gray-400 mb-2">
+        <span className="mr-2 text-indigo-400">{icon}</span>
+        <span className="text-sm font-medium uppercase tracking-wider">{label}</span>
+      </div>
+      <div className="text-3xl font-bold text-white">{value}</div>
+      {detail && <div className="text-xs text-gray-500 mt-1">{detail}</div>}
+    </div>
+  );
+}
+
+/** The game's name, which turns into a text field to rename it. */
+function GameTitle({ game, onRenamed }: { game: GameLibraryItem; onRenamed: (name: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(game.name);
+
+  const save = async () => {
+    const trimmed = name.trim();
+    if (trimmed === game.name) {
+      setEditing(false);
+      return;
+    }
+    try {
+      await invoke('rename_game', { gameId: game.id, name: trimmed });
+      onRenamed(trimmed);
+      setEditing(false);
+    } catch (e) {
+      reportError("Couldn't rename the game", e);
+    }
+  };
+
+  if (editing) {
+    return (
+      <input
+        autoFocus
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        onBlur={save}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') save();
+          if (e.key === 'Escape') {
+            setName(game.name);
+            setEditing(false);
+          }
+        }}
+        aria-label="Game name"
+        className="text-3xl font-bold text-white bg-gray-800 border border-indigo-500 rounded-lg px-3 py-1 focus:outline-none min-w-0"
+      />
+    );
+  }
+
+  return (
+    <h1 className="group text-4xl font-bold text-white tracking-tight flex items-center gap-3 min-w-0">
+      <span className="truncate">{game.name}</span>
+      <button
+        onClick={() => {
+          setName(game.name);
+          setEditing(true);
+        }}
+        className="text-gray-500 hover:text-white opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+        aria-label="Rename game"
+      >
+        <Pencil size={18} />
+      </button>
+    </h1>
+  );
+}
+
+function ActionsMenu({ onChangeCover, onRemove }: { onChangeCover: () => void; onRemove: () => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setOpen(false);
+    document.addEventListener('mousedown', close);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', close);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const item = 'w-full flex items-center gap-2 px-4 py-2 text-sm text-left';
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        onClick={() => setOpen(!open)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label="More actions"
+        className="p-2 rounded-lg border bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700"
+      >
+        <MoreHorizontal size={18} />
+      </button>
+      {open && (
+        <div role="menu" className="absolute right-0 mt-2 w-52 bg-gray-800 border border-gray-700 rounded-xl shadow-2xl py-1 z-20">
+          <button role="menuitem" className={`${item} text-gray-200 hover:bg-gray-700`} onClick={() => { setOpen(false); onChangeCover(); }}>
+            <Image size={16} /> Change cover
+          </button>
+          <button role="menuitem" className={`${item} text-red-300 hover:bg-red-900/40`} onClick={() => { setOpen(false); onRemove(); }}>
+            <Trash2 size={16} /> Remove from library
+          </button>
+        </div>
+      )}
     </div>
   );
 }

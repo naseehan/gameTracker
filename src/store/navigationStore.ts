@@ -1,11 +1,10 @@
 import { create } from 'zustand';
 
-export type Route = 
+export type Route =
+  | { type: 'home' }
   | { type: 'library' }
-  | { type: 'recent' }
   | { type: 'stats' }
   | { type: 'settings' }
-  | { type: 'playing' }
   | { type: 'game_details'; gameId: number };
 
 interface NavigationState {
@@ -16,25 +15,25 @@ interface NavigationState {
 }
 
 export const useNavigationStore = create<NavigationState>((set, get) => ({
-  currentRoute: { type: 'library' },
+  currentRoute: { type: 'home' },
   history: [],
   navigate: (route) => {
     const current = get().currentRoute;
     // Don't push to history if it's the exact same route
     if (JSON.stringify(current) === JSON.stringify(route)) return;
-    
+
     set((state) => ({
       currentRoute: route,
-      history: [...state.history, current],
+      history: [...state.history, current].slice(-50),
     }));
   },
   goBack: () => {
     set((state) => {
       if (state.history.length === 0) return { currentRoute: { type: 'library' } };
-      
+
       const newHistory = [...state.history];
       const previousRoute = newHistory.pop()!;
-      
+
       return {
         currentRoute: previousRoute,
         history: newHistory,

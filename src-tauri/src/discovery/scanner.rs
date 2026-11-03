@@ -1,149 +1,80 @@
+use crate::detection::filters::{is_non_game_dir, is_non_game_exe};
 use crate::discovery::models::GameCandidate;
 use std::path::Path;
 use walkdir::WalkDir;
 
+/// How deep to look for executables inside a game folder. Unreal Engine games keep the
+/// real binary at `<Game>/<Project>/Binaries/Win64/<Project>-Win64-Shipping.exe`.
+const MAX_EXE_DEPTH: usize = 5;
+
+/// Sub-folders games keep their own binaries in. A folder that has one is a single
+/// game, not a library of games.
+const GAME_BINARY_DIRS: [&str; 8] = [
+    "bin", "bin64", "bin32", "binaries", "x64", "x86", "win64", "win32",
+];
+
+/// Folders that are never games when scanning a library folder.
+const SYSTEM_DIRS: [&str; 5] = [
+    "windows",
+    "program files",
+    "program files (x86)",
+    "$recycle.bin",
+    "system volume information",
+];
+
+/// Scans a folder the user picked. It can be a single game (`D:\Games\Hades`) or a
+/// library of games (`D:\Games`), in which case every sub-folder is a candidate.
 pub fn scan_folder(folder_path: &str) -> Vec<GameCandidate> {
-    let mut candidates = Vec::new();
     let root = Path::new(folder_path);
-
-    if !root.exists() || !root.is_dir() {
-        return candidates;
+    if !root.is_dir() {
+        return Vec::new();
     }
 
-    // Heuristics for skipping known non-game subdirectories globally
-    let ignored_dirs = [
-        "_CommonRedist",
-        "Redist",
-        "DirectX",
-        "vcredist",
-        "DotNet",
-        "Engine",
-        "Binaries",
-        "Saved",
-        "CrashReporter",
-    ];
-
-    // Heuristics for skipping non-game executables
-    let ignored_exes = [
-        "uninstall.exe",
-        "unins000.exe",
-        "crashreporter.exe",
-        "unitycrashhandler64.exe",
-        "unitycrashhandler32.exe",
-        "setup.exe",
-        "dxsetup.exe",
-        "vcredist_x64.exe",
-        "vcredist_x86.exe",
-        "launcher.exe", // We might want launcher, but often it's just an updater. We'll include it if it's the only one, but filter by default if there are others.
-    ];
-
-    // If the folder itself contains many .exe files, it might be a single game directory.
-    // If the folder has subdirectories with .exe files, it might be a library directory (like D:\Games).
-    // To handle both, we will just iterate immediate subdirectories.
-
-    // Let's first check if the root itself is a game directory
-    let root_candidate = evaluate_directory_as_game(root, &ignored_dirs, &ignored_exes);
-    if let Some(candidate) = root_candidate {
-        candidates.push(candidate);
+    if looks_like_single_game(root) {
+        return evaluate_game_folder(root).into_iter().collect();
     }
 
-    // Now check immediate subdirectories
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.is_dir() {
-                // If it's a directory, evaluate it
-                if let Some(candidate) =
-                    evaluate_directory_as_game(&path, &ignored_dirs, &ignored_exes)
-                {
-                    // Prevent duplicates if we accidentally scanned it twice
-                    if !candidates
-                        .iter()
-                        .any(|c| c.install_path == candidate.install_path)
-                    {
-                        candidates.push(candidate);
-                    }
-                }
-            }
-        }
-    }
+    let mut candidates: Vec<GameCandidate> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|path| path.is_dir() && !is_hidden_or_system(path))
+        .filter_map(|path| evaluate_game_folder(&path))
+        .collect();
+    candidates.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
+    if candidates.is_empty() {
+        // No sub-folder holds a game, so the folder itself might be one.
+        return evaluate_game_folder(root).into_iter().collect();
+    }
     candidates
 }
 
-fn evaluate_directory_as_game(
-    dir: &Path,
-    ignored_dirs: &[&str],
-    ignored_exes: &[&str],
-) -> Option<GameCandidate> {
+/// Treats one folder as a game and collects its executables.
+pub fn evaluate_game_folder(dir: &Path) -> Option<GameCandidate> {
     let dir_name = dir.file_name()?.to_string_lossy().to_string();
 
-    // Skip hidden or system-like directories
-    if dir_name.starts_with('.')
-        || dir_name == "Windows"
-        || dir_name == "Program Files"
-        || dir_name == "Program Files (x86)"
-    {
-        return None;
-    }
-
-    let mut executables = Vec::new();
-
-    // Use WalkDir to find all .exe files up to depth 3
-    for entry in WalkDir::new(dir)
-        .max_depth(3)
+    let mut executables: Vec<String> = WalkDir::new(dir)
+        .max_depth(MAX_EXE_DEPTH)
         .into_iter()
+        // Don't descend into redistributable, engine-tool or save folders.
+        .filter_entry(|e| {
+            e.depth() == 0
+                || !(e.file_type().is_dir() && is_non_game_dir(&e.file_name().to_string_lossy()))
+        })
         .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
+        .filter(|e| e.file_type().is_file() && is_game_exe(e.path()))
+        .map(|e| e.path().to_string_lossy().to_string())
+        .collect();
 
-        // Skip ignored directories
-        if path.is_dir() {
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            if ignored_dirs.iter().any(|&d| name.eq_ignore_ascii_case(d)) {
-                // We don't have a way to skip descending directly in this simple loop, but we can filter the files
-                continue;
-            }
-        }
-
-        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("exe") {
-            let file_name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let file_name_lower = file_name.to_lowercase();
-
-            // Filter obvious non-game executables
-            if ignored_exes.contains(&file_name_lower.as_str()) {
-                continue;
-            }
-
-            // Check if path contains any ignored directory
-            let path_str = path.to_string_lossy().to_string();
-            let contains_ignored_dir = ignored_dirs
-                .iter()
-                .any(|&d| path_str.to_lowercase().contains(&d.to_lowercase()));
-
-            if !contains_ignored_dir {
-                // Store the relative or absolute path?
-                // Let's store the absolute path so we can register it accurately
-                executables.push(path_str);
-            }
-        }
+    // Launchers are often just updaters, so keep them only if there's nothing else.
+    if executables.iter().any(|exe| !is_launcher(exe)) {
+        executables.retain(|exe| !is_launcher(exe));
     }
-
     if executables.is_empty() {
         return None;
     }
-
-    // Clean up launcher.exe vs main game exe logic:
-    // If we have multiple exes, prefer the one matching the folder name.
-    // For now, return all candidates and let user/system pick.
 
     Some(GameCandidate {
         name: dir_name,
@@ -155,32 +86,146 @@ fn evaluate_directory_as_game(
     })
 }
 
+/// True if the folder holds a game directly: an executable at its top level, or a
+/// binaries sub-folder such as `bin\x64` that contains one.
+fn looks_like_single_game(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                GAME_BINARY_DIRS.contains(&name.as_str())
+                    && WalkDir::new(&path)
+                        .max_depth(3)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                        .any(|e| e.file_type().is_file() && is_game_exe(e.path()))
+            } else {
+                is_game_exe(&path)
+            }
+        })
+}
+
+fn is_game_exe(path: &Path) -> bool {
+    let is_exe = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+    is_exe
+        && !path
+            .file_name()
+            .is_some_and(|name| is_non_game_exe(&name.to_string_lossy()))
+}
+
+fn is_launcher(exe_path: &str) -> bool {
+    Path::new(exe_path)
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("launcher.exe"))
+}
+
+fn is_hidden_or_system(dir: &Path) -> bool {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    name.starts_with('.') || SYSTEM_DIRS.contains(&name.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::tempdir;
+
+    fn touch(path: PathBuf) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "dummy").unwrap();
+    }
+
+    fn names(candidates: &[GameCandidate]) -> Vec<&str> {
+        candidates.iter().map(|c| c.name.as_str()).collect()
+    }
 
     #[test]
     fn test_scanner_filters_non_games() {
         let dir = tempdir().unwrap();
         let game_dir = dir.path().join("MyGame");
-        fs::create_dir(&game_dir).unwrap();
-        fs::write(game_dir.join("MyGame.exe"), "dummy").unwrap();
-        fs::write(game_dir.join("uninstall.exe"), "dummy").unwrap();
-
-        let redist_dir = game_dir.join("_CommonRedist");
-        fs::create_dir(&redist_dir).unwrap();
-        fs::write(redist_dir.join("vcredist_x64.exe"), "dummy").unwrap();
+        touch(game_dir.join("MyGame.exe"));
+        touch(game_dir.join("uninstall.exe"));
+        touch(game_dir.join("_CommonRedist").join("vcredist_x64.exe"));
 
         let candidates = scan_folder(dir.path().to_str().unwrap());
 
-        assert_eq!(candidates.len(), 1);
-        let candidate = &candidates[0];
-        assert_eq!(candidate.name, "MyGame");
-
+        assert_eq!(names(&candidates), ["MyGame"]);
         // Should only contain MyGame.exe, not uninstall.exe or vcredist
-        assert_eq!(candidate.executables.len(), 1);
-        assert!(candidate.executables[0].ends_with("MyGame.exe"));
+        assert_eq!(candidates[0].executables.len(), 1);
+        assert!(candidates[0].executables[0].ends_with("MyGame.exe"));
+    }
+
+    #[test]
+    fn test_library_folder_is_not_a_game_itself() {
+        let dir = tempdir().unwrap();
+        let library = dir.path().join("Games");
+        touch(library.join("Hollow Knight").join("hollow_knight.exe"));
+        touch(library.join("Celeste").join("Celeste.exe"));
+
+        let candidates = scan_folder(library.to_str().unwrap());
+
+        assert_eq!(names(&candidates), ["Celeste", "Hollow Knight"]);
+    }
+
+    #[test]
+    fn test_picking_a_game_folder_with_a_bin_folder() {
+        let dir = tempdir().unwrap();
+        let game = dir.path().join("The Witcher 3");
+        touch(game.join("bin").join("x64").join("witcher3.exe"));
+        fs::create_dir_all(game.join("content")).unwrap();
+
+        let candidates = scan_folder(game.to_str().unwrap());
+
+        assert_eq!(names(&candidates), ["The Witcher 3"]);
+    }
+
+    #[test]
+    fn test_engine_in_a_game_name_is_not_filtered() {
+        let dir = tempdir().unwrap();
+        touch(dir.path().join("Space Engineers").join("Bin64").join("SpaceEngineers.exe"));
+
+        let candidates = scan_folder(dir.path().to_str().unwrap());
+
+        assert_eq!(names(&candidates), ["Space Engineers"]);
+    }
+
+    #[test]
+    fn test_finds_unreal_shipping_binary() {
+        let dir = tempdir().unwrap();
+        let game = dir.path().join("Stray");
+        touch(game.join("Stray.exe"));
+        touch(game.join("Hk_project").join("Binaries").join("Win64").join("Stray-Win64-Shipping.exe"));
+        touch(game.join("Engine").join("Binaries").join("Win64").join("CrashReportClient.exe"));
+
+        let candidates = scan_folder(dir.path().to_str().unwrap());
+
+        let exes = &candidates[0].executables;
+        assert_eq!(exes.len(), 2, "{:?}", exes);
+        assert!(exes.iter().any(|e| e.ends_with("Stray-Win64-Shipping.exe")));
+    }
+
+    #[test]
+    fn test_uppercase_extension_and_launcher_only_games() {
+        let dir = tempdir().unwrap();
+        touch(dir.path().join("OldGame").join("GAME.EXE"));
+        touch(dir.path().join("OldGame").join("Launcher.exe"));
+        touch(dir.path().join("LauncherOnly").join("Launcher.exe"));
+
+        let candidates = scan_folder(dir.path().to_str().unwrap());
+
+        assert_eq!(names(&candidates), ["LauncherOnly", "OldGame"]);
+        assert!(candidates[1].executables[0].ends_with("GAME.EXE"));
+        assert_eq!(candidates[1].executables.len(), 1);
+        assert!(candidates[0].executables[0].ends_with("Launcher.exe"));
     }
 }

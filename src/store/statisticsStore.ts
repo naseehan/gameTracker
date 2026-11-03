@@ -1,10 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
-
-export interface DailyPlaytime {
-  date_label: string;
-  playtime_seconds: number;
-}
+import { DailyPlaytime } from '../types';
 
 export interface TopGame {
   game_id: number;

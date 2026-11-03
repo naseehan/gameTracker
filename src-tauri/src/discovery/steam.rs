@@ -1,9 +1,14 @@
 use super::models::GameCandidate;
 use super::provider::DiscoveryProvider;
-use super::scanner::scan_folder;
+use super::reg_query;
+use super::scanner::evaluate_game_folder;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+/// Where Steam is installed, if it is.
+pub fn steam_install_path() -> Option<PathBuf> {
+    SteamProvider::new().get_steam_path()
+}
 
 pub struct SteamProvider {
     override_path: Option<PathBuf>,
@@ -28,10 +33,7 @@ impl SteamProvider {
             return Some(p.clone());
         }
         // 1. Try registry
-        if let Ok(output) = Command::new("reg")
-            .args(&["query", "HKCU\\Software\\Valve\\Steam", "/v", "SteamPath"])
-            .output()
-        {
+        if let Ok(output) = reg_query(&["HKCU\\Software\\Valve\\Steam", "/v", "SteamPath"]) {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
@@ -155,18 +157,12 @@ impl DiscoveryProvider for SteamProvider {
                             }
 
                             // Use existing scanner to find executables
-                            let mut found_candidate = false;
-                            for mut candidate in scan_folder(&game_folder.to_string_lossy()) {
-                                if std::path::Path::new(&candidate.install_path) == game_folder {
-                                    candidate.name = name.clone();
-                                    candidate.source = "Steam".to_string();
-                                    candidate.platform_app_id = Some(app_id.clone());
-                                    candidates.push(candidate);
-                                    found_candidate = true;
-                                    break;
-                                }
-                            }
-                            if !found_candidate {
+                            if let Some(mut candidate) = evaluate_game_folder(&game_folder) {
+                                candidate.name = name.clone();
+                                candidate.source = "Steam".to_string();
+                                candidate.platform_app_id = Some(app_id.clone());
+                                candidates.push(candidate);
+                            } else {
                                 // We found the manifest and folder, but no obvious exes.
                                 // Still add it with low confidence so user can pick!
                                 candidates.push(GameCandidate {

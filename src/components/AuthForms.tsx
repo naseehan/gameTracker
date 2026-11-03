@@ -3,6 +3,8 @@ import { supabase } from '../store/authStore';
 import { Loader2, AlertCircle, Check } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { invoke } from '@tauri-apps/api/core';
+import { error as logError } from '@tauri-apps/plugin-log';
+import { describeError } from '../utils/errors';
 
 interface AuthFormsProps {
   onSuccess: () => void;
@@ -76,8 +78,6 @@ export function AuthForms({ onSuccess, onCancel, initialMode = 'login' }: AuthFo
       setError(null);
       setLoading(true);
       
-      console.log('[OAuth] Google sign-in started');
-
       // Start a one-shot local HTTP server to receive the callback
       const port = await invoke<number>('start_oauth_listener');
       const redirectTo = `http://127.0.0.1:${port}/callback`;
@@ -96,14 +96,13 @@ export function AuthForms({ onSuccess, onCancel, initialMode = 'login' }: AuthFo
         if (data.url.includes('mock-project.supabase.co')) {
           setError('Google Sign-In requires a real Supabase configuration. Please provide a real Supabase URL to enable OAuth.');
         } else {
-          console.log('[OAuth] OAuth URL generated, opening browser');
           await openUrl(data.url);
           setMessage('Please complete the sign-in in your web browser.');
         }
       }
     } catch (err: any) {
       setError('Unable to connect to Google authentication.');
-      console.error('[OAuth] Error:', err);
+      logError(`Google sign-in failed: ${describeError(err)}`).catch(() => {});
     } finally {
       setLoading(false);
     }

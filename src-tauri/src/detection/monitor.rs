@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProcessEvent {
@@ -26,9 +26,8 @@ pub struct ProcessMonitor {
 
 impl ProcessMonitor {
     pub fn new() -> Self {
-        let system = System::new_all();
         Self {
-            system,
+            system: System::new(),
             known_processes: HashMap::new(),
         }
     }
@@ -36,7 +35,13 @@ impl ProcessMonitor {
     pub fn poll(&mut self) -> Vec<ProcessEvent> {
         let mut events = Vec::new();
 
-        self.system.refresh_processes(ProcessesToUpdate::All, true);
+        // Only names and executable paths are needed; skipping CPU, memory and disk
+        // stats keeps polling every few seconds cheap.
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
+        );
 
         let current_processes = self.system.processes();
         let mut current_pids = HashSet::new();
@@ -48,7 +53,7 @@ impl ProcessMonitor {
             let name = process.name().to_string_lossy().to_string();
             let path = process.exe().map(|p| p.to_string_lossy().into_owned());
 
-            if let Some((known_name, known_path)) = self.known_processes.get_mut(&pid_u32) {
+            if let Some((_, known_path)) = self.known_processes.get_mut(&pid_u32) {
                 // If we previously didn't have a path, and now we do, we should emit a Started event again
                 // so that the GameDetector can identify it properly using the exact path.
                 if known_path.is_none() && path.is_some() {
@@ -98,7 +103,6 @@ impl ProcessMonitor {
 /// games that are already running get picked up after tracking state was reset.
 pub fn spawn_monitor_thread(
     event_sender: Sender<ProcessEvent>,
-    shared_known_processes: Arc<Mutex<HashMap<u32, String>>>,
     poll_interval_secs: Arc<AtomicU64>,
     resync: Arc<AtomicBool>,
 ) {
@@ -110,21 +114,6 @@ pub fn spawn_monitor_thread(
                 monitor.forget_known_processes();
             }
             let events = monitor.poll();
-
-            if !events.is_empty() {
-                if let Ok(mut known) = shared_known_processes.lock() {
-                    for event in &events {
-                        match event {
-                            ProcessEvent::Started { pid, name, .. } => {
-                                known.insert(*pid, name.clone());
-                            }
-                            ProcessEvent::Stopped { pid, .. } => {
-                                known.remove(pid);
-                            }
-                        }
-                    }
-                }
-            }
 
             for event in events {
                 if event_sender.send(event).is_err() {

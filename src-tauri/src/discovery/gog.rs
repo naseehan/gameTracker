@@ -1,7 +1,7 @@
 use super::models::GameCandidate;
 use super::provider::DiscoveryProvider;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use super::reg_query;
+use std::path::PathBuf;
 
 pub struct GogProvider {
     mock_reg_output: Option<String>,
@@ -26,9 +26,7 @@ impl GogProvider {
             return Ok(mock.clone());
         }
 
-        let output = Command::new("reg")
-            .args(&["query", "HKLM\\SOFTWARE\\WOW6432Node\\GOG.com\\Games", "/s"])
-            .output();
+        let output = reg_query(&["HKLM\\SOFTWARE\\WOW6432Node\\GOG.com\\Games", "/s"]);
 
         match output {
             Ok(output) if output.status.success() => {
@@ -36,9 +34,7 @@ impl GogProvider {
             }
             _ => {
                 // Also try the non-WOW6432Node path just in case
-                let output = Command::new("reg")
-                    .args(&["query", "HKLM\\SOFTWARE\\GOG.com\\Games", "/s"])
-                    .output();
+                let output = reg_query(&["HKLM\\SOFTWARE\\GOG.com\\Games", "/s"]);
 
                 match output {
                     Ok(output) if output.status.success() => {
@@ -70,7 +66,7 @@ impl DiscoveryProvider for GogProvider {
         let mut current_exe = String::new();
 
         // Helper to push a candidate and reset
-        let mut push_candidate = |id: &mut String,
+        let push_candidate = |id: &mut String,
                                   name: &mut String,
                                   path: &mut String,
                                   exe: &mut String,
@@ -121,17 +117,15 @@ impl DiscoveryProvider for GogProvider {
                 if let Some(id) = line.split('\\').last() {
                     current_id = id.to_string();
                 }
-            } else if line.starts_with("gameName") {
-                if let Some(val) = line.split("REG_SZ").nth(1) {
-                    current_name = val.trim().to_string();
-                }
-            } else if line.starts_with("path") {
-                if let Some(val) = line.split("REG_SZ").nth(1) {
-                    current_path = val.trim().to_string();
-                }
-            } else if line.starts_with("exe") {
-                if let Some(val) = line.split("REG_SZ").nth(1) {
-                    current_exe = val.trim().to_string();
+            } else if let Some((key, value)) = line.split_once("REG_SZ") {
+                // Value lines look like `name    REG_SZ    data`. Compare whole names:
+                // `exeFile` (just the file name) must not overwrite `exe` (the full path).
+                let value = value.trim().to_string();
+                match key.trim() {
+                    "gameName" => current_name = value,
+                    "path" => current_path = value,
+                    "exe" => current_exe = value,
+                    _ => {}
                 }
             }
         }
@@ -186,5 +180,27 @@ HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\GOG.com\Games\12345
             candidates[1].executables[0],
             "D:\\Games\\Witcher 3\\bin\\x64\\witcher3.exe"
         );
+    }
+
+    #[test]
+    fn test_gog_exe_file_does_not_override_exe() {
+        let mock_output = r#"
+HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\GOG.com\Games\1207664643
+    exe    REG_SZ    D:\GOG Games\The Witcher 3\bin\x64\witcher3.exe
+    exeFile    REG_SZ    witcher3.exe
+    gameName    REG_SZ    The Witcher 3
+    path    REG_SZ    D:\GOG Games\The Witcher 3
+    pathname    REG_SZ    unused
+"#;
+
+        let provider = GogProvider::with_mock_output(mock_output.to_string());
+        let candidates = provider.discover_games().unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].executables[0],
+            r"D:\GOG Games\The Witcher 3\bin\x64\witcher3.exe"
+        );
+        assert_eq!(candidates[0].install_path, r"D:\GOG Games\The Witcher 3");
     }
 }
